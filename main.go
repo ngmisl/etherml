@@ -680,15 +680,92 @@ type item struct {
 	wallet Wallet
 }
 
+// TUI Color Palette
+const (
+	primaryColor   = "#00D4FF"
+	secondaryColor = "#FF6B6B"
+	accentColor    = "#4ECDC4"
+	successColor   = "#45B7D1"
+	warningColor   = "#FFA07A"
+	errorColor     = "#FF6B6B"
+	textColor      = "#E1E1E6"
+	mutedColor     = "#8892B0"
+	bgColor        = "#0D1117"
+	cardBgColor    = "#161B22"
+	borderColor    = "#21262D"
+)
+
 // TUI Styles
 var (
-	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true)
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true)
-	warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true)
-	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#00AAFF")).Bold(true)
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Background(lipgloss.Color("#004400")).Bold(true)
-	headerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#444444")).Bold(true).Padding(0, 1)
-	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Italic(true)
+	// Base styles
+	baseStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(textColor))
+
+	// Message styles
+	successStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(successColor)).
+		Bold(true)
+
+	errorStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(errorColor)).
+		Bold(true)
+
+	warningStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(warningColor)).
+		Bold(true)
+
+	infoStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(primaryColor)).
+		Bold(true)
+
+	mutedStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(mutedColor))
+
+	// Layout styles
+	headerStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color(primaryColor)).
+		Bold(true).
+		Padding(0, 1)
+
+	cardStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(textColor))
+
+	selectedCardStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(primaryColor)).
+		Background(lipgloss.Color(cardBgColor)).
+		Bold(true)
+
+	modalStyle = lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color(primaryColor)).
+		Background(lipgloss.Color(bgColor)).
+		Padding(2, 4).
+		AlignHorizontal(lipgloss.Center).
+		AlignVertical(lipgloss.Center)
+
+	statusBarStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(textColor)).
+		Italic(true)
+
+	helpBarStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(mutedColor))
+
+	titleStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(primaryColor)).
+		Bold(true).
+		MarginBottom(1)
+
+	addressStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(accentColor)).
+		Bold(true)
+
+	labelStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(textColor)).
+		Italic(true)
+
+	iconStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(primaryColor))
 )
 
 func (i item) FilterValue() string { 
@@ -698,19 +775,22 @@ func (i item) FilterValue() string {
 
 func (i item) Title() string {
 	addr := hex.EncodeToString(i.wallet.Address[:])
-	addressStr := "0x" + addr
+	addressStr := "0x" + addr[:8] + "..." + addr[len(addr)-6:]
+	
 	if i.wallet.Label != "" {
-		return fmt.Sprintf("%s (%s)", infoStyle.Render(i.wallet.Label), addressStr)
+		return fmt.Sprintf("💳 %s", i.wallet.Label)
 	}
-	return addressStr
+	return fmt.Sprintf("💳 %s", addressStr)
 }
 
 func (i item) Description() string {
-	label := i.wallet.Label
-	if label == "" {
-		label = helpStyle.Render("No label")
+	addr := hex.EncodeToString(i.wallet.Address[:])
+	addressStr := "0x" + addr[:8] + "..." + addr[len(addr)-6:]
+	
+	if i.wallet.Label != "" {
+		return fmt.Sprintf("%s • %s", addressStr, i.wallet.CreatedAt.Format("Jan 2, 2006"))
 	}
-	return fmt.Sprintf("%s | Created: %s", label, i.wallet.CreatedAt.Format("2006-01-02 15:04"))
+	return i.wallet.CreatedAt.Format("Jan 2, 2006 15:04")
 }
 
 // Initialize clipboard
@@ -770,15 +850,24 @@ func initialModel(walletMgr *WalletManager) model {
 	}
 
 	const defaultWidth = 80
-	const listHeight = 12
+	const listHeight = 15
 
-	l := list.New(items, list.NewDefaultDelegate(), defaultWidth, listHeight)
-	l.Title = headerStyle.Render("🔒 Ethereum Quantum-Resistant Wallet Manager")
-	l.SetShowStatusBar(false) // Disable built-in status bar
-	l.SetFilteringEnabled(false) // We'll implement our own search
-	l.Styles.Title = headerStyle.MarginLeft(1).MarginBottom(1)
-	l.Styles.PaginationStyle = helpStyle.PaddingLeft(2)
-	l.Styles.HelpStyle = helpStyle.PaddingLeft(2)
+	// Create simple delegate for compact list
+	delegate := list.NewDefaultDelegate()
+	delegate.Styles.SelectedTitle = selectedCardStyle
+	delegate.Styles.SelectedDesc = mutedStyle
+	delegate.Styles.NormalTitle = cardStyle
+	delegate.Styles.NormalDesc = mutedStyle
+	delegate.SetHeight(2) // Compact item height
+	
+	l := list.New(items, delegate, defaultWidth, listHeight)
+	l.Title = "" // Remove duplicate title - we use custom header
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+	l.SetShowPagination(true)
+	l.SetShowHelp(false)
+	l.Styles.Title = titleStyle
+	l.Styles.PaginationStyle = mutedStyle
 
 	// Input for wallet labels
 	ti := textinput.New()
@@ -1030,32 +1119,34 @@ func (m model) View() string {
 		return successStyle.Render("👋 Goodbye! Stay secure!") + "\n"
 	}
 
-	// Handle input modes
+	// Handle input modes with simple overlay
 	if m.inputMode != "" {
 		var title, inputView, helpText string
 		
 		switch m.inputMode {
 		case "new":
-			title = headerStyle.Render("✨ Create New Wallet")
+			title = "✨ Create New Wallet"
 			inputView = m.input.View()
-			helpText = helpStyle.Render("Enter to create • Esc to cancel")
+			helpText = "Enter to create • Esc to cancel"
 		case "search":
-			title = headerStyle.Render("🔍 Search Wallets")
+			title = "🔍 Search Wallets"
 			inputView = m.input.View()
-			helpText = helpStyle.Render("Enter to search • Esc to cancel")
+			helpText = "Enter to search • Esc to cancel"
 		case "password":
-			title = errorStyle.Render("🔐 Authentication Required")
+			title = "🔐 Authentication Required"
 			inputView = m.passwordInput.View()
-			helpText = helpStyle.Render("Enter master password • Esc to cancel")
+			helpText = "Enter master password • Esc to cancel"
 		}
 		
-		return fmt.Sprintf(
-			"%s\n\n%s\n\n%s\n\n%s",
-			title,
+		content := fmt.Sprintf(
+			"%s\n%s\n%s",
+			titleStyle.Render(title),
 			inputView,
-			helpText,
-			m.status,
-		) + "\n"
+			mutedStyle.Render(helpText),
+		)
+		
+		modal := modalStyle.Copy().Padding(1, 2).Render(content)
+		return lipgloss.Place(80, 24, lipgloss.Center, lipgloss.Center, modal)
 	}
 
 	// Show private key if authenticated
@@ -1063,20 +1154,17 @@ func (m model) View() string {
 		privateKeyHex := "0x" + hex.EncodeToString(m.selectedWallet.PrivateKey[:])
 		addressHex := "0x" + hex.EncodeToString(m.selectedWallet.Address[:])
 		
-		view := fmt.Sprintf(
-			"%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n\n%s",
-			errorStyle.Render("⚠️  PRIVATE KEY - KEEP SECURE!"),
-			headerStyle.Render("Address:"),
-			infoStyle.Render(addressHex),
-			headerStyle.Render("Private Key:"),
-			errorStyle.Render(privateKeyHex),
-			warningStyle.Render("🔒 This private key controls your funds! Store it securely."),
-			helpStyle.Render("Press any key to continue..."),
+		content := fmt.Sprintf(
+			"%s\n%s\n%s\n%s\n%s",
+			titleStyle.Render("🔐 Private Key Export"),
+			errorStyle.Render("⚠️  KEEP SECURE!"),
+			fmt.Sprintf("Address: %s", addressStyle.Render(addressHex)),
+			fmt.Sprintf("Private Key: %s", errorStyle.Render(privateKeyHex)),
+			mutedStyle.Render("Press any key to clear..."),
 		)
 		
-		// Note: Private key will be cleared when user presses any key
-		
-		return view
+		modal := modalStyle.Copy().Padding(1, 2).Render(content)
+		return lipgloss.Place(80, 24, lipgloss.Center, lipgloss.Center, modal)
 	}
 
 	// Show delete confirmation if active
@@ -1084,35 +1172,48 @@ func (m model) View() string {
 		addressHex := "0x" + hex.EncodeToString(m.walletToDelete.Address[:])
 		label := m.walletToDelete.Label
 		if label == "" {
-			label = "No label"
+			label = "Unlabeled Wallet"
 		}
 		
-		view := fmt.Sprintf(
-			"%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n\n%s",
-			errorStyle.Render("⚠️  CONFIRM WALLET DELETION"),
-			headerStyle.Render("Address:"),
-			infoStyle.Render(addressHex),
-			headerStyle.Render("Label:"),
-			infoStyle.Render(label),
-			warningStyle.Render("⚠️ This action cannot be undone! The wallet and private key will be permanently deleted."),
-			helpStyle.Render("Press 'y' to confirm, 'n' or Esc to cancel"),
+		content := fmt.Sprintf(
+			"%s\n%s\n%s\n%s\n%s",
+			titleStyle.Render("🗑️ Confirm Deletion"),
+			errorStyle.Render("⚠️  PERMANENT ACTION!"),
+			fmt.Sprintf("Wallet: %s", label),
+			fmt.Sprintf("Address: %s", addressStyle.Render(addressHex[:16]+"...")),
+			mutedStyle.Render("Press 'y' to confirm • 'n' or Esc to cancel"),
 		)
 		
-		return view
+		modal := modalStyle.Copy().Padding(1, 2).Render(content)
+		return lipgloss.Place(80, 24, lipgloss.Center, lipgloss.Center, modal)
 	}
 
-	// Main view
-	mainView := m.list.View()
+	// Compact main layout
+	var output strings.Builder
 	
-	// Status section
-	statusSection := fmt.Sprintf("\n%s\n", m.status)
+	// Header
+	output.WriteString(headerStyle.Render("🔒 Quantum-Resistant Ethereum Wallet"))
+	output.WriteString("\n")
 	
-	// Help text
-	helpText := helpStyle.Render(
-		"n: new • c: copy address • e: export key • d: delete • /: search • q: quit",
-	)
+	// Search info (if active)
+	if m.searchQuery != "" {
+		output.WriteString(mutedStyle.Render(fmt.Sprintf("🔍 '%s' (%d results)", m.searchQuery, len(m.filteredWallets))))
+		output.WriteString("\n")
+	}
 	
-	return fmt.Sprintf("%s%s%s", mainView, statusSection, helpText)
+	// Main wallet list
+	output.WriteString(m.list.View())
+	
+	// Status line
+	output.WriteString("\n")
+	output.WriteString(statusBarStyle.Render(m.status))
+	
+	// Help line
+	output.WriteString("\n")
+	helpText := "n:new • c:copy • e:export • d:delete • /:search • q:quit"
+	output.WriteString(helpBarStyle.Render(helpText))
+	
+	return output.String()
 }
 
 // Read password securely
