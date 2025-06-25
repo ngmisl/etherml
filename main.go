@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
+	"crypto/mlkem"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -23,6 +24,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/ethereum/go-ethereum/crypto"
+	"golang.design/x/clipboard"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/term"
 )
@@ -56,11 +58,16 @@ type EncryptedWallet struct {
 
 // StorageFile represents the encrypted storage format
 type StorageFile struct {
-	Version   string            `json:"version"`
-	Algorithm string            `json:"algorithm"`
-	KDF       KDFParams         `json:"kdf"`
-	Wallets   []EncryptedWallet `json:"wallets"`
-	UpdatedAt time.Time         `json:"updated_at"`
+	Version             string            `json:"version"`
+	Algorithm           string            `json:"algorithm"`
+	KDF                 KDFParams         `json:"kdf"`
+	MLKEMPublicKey      string            `json:"mlkem_public_key,omitempty"`
+	MLKEMPrivateKeyEnc  string            `json:"mlkem_private_key_enc,omitempty"`
+	MLKEMPrivateKeyNonce string           `json:"mlkem_private_key_nonce,omitempty"`
+	EncryptedWallets    string            `json:"encrypted_wallets,omitempty"`
+	HMAC                string            `json:"hmac,omitempty"`
+	Wallets             []EncryptedWallet `json:"wallets"` // Legacy support
+	UpdatedAt           time.Time         `json:"updated_at"`
 }
 
 // KDFParams for Argon2id
@@ -75,9 +82,11 @@ type KDFParams struct {
 
 // WalletManager handles wallet operations
 type WalletManager struct {
-	filePath string
-	storage  *StorageFile
-	key      []byte
+	filePath       string
+	storage        *StorageFile
+	key            []byte
+	mlkemPrivateKey []byte
+	masterPassword []byte
 }
 
 // Result type for error handling
@@ -182,6 +191,91 @@ func deriveKey(password []byte, salt Salt, params KDFParams) []byte {
 	return argon2.IDKey(password, salt[:], params.Iterations, params.Memory, params.Parallelism, params.KeyLen)
 }
 
+// Generate ML-KEM-1024 keypair (non-deterministic for now, will improve later)
+func generateMLKEMKeyPair() ([]byte, []byte, error) {
+	decapsKey, err := mlkem.GenerateKey1024()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate ML-KEM-1024 keypair: %w", err)
+	}
+	encapsKey := decapsKey.EncapsulationKey()
+	
+	// ML-KEM keys in Go are already byte arrays
+	encapsKeyBytes := encapsKey.Bytes()
+	decapsKeyBytes := decapsKey.Bytes()
+	
+	return encapsKeyBytes, decapsKeyBytes, nil
+}
+
+// Encrypt data using ML-KEM-1024 + AES-256-GCM hybrid approach
+func encryptDataPQC(plaintext []byte, encapsKeyBytes []byte) (EncryptedData, string, error) {
+	// Create the encapsulation key
+	encapsKey, err := mlkem.NewEncapsulationKey1024(encapsKeyBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create encapsulation key: %w", err)
+	}
+	
+	// Generate shared secret using ML-KEM-1024
+	sharedSecret, ciphertext := encapsKey.Encapsulate()
+
+	// Use shared secret as AES key (first 32 bytes for AES-256)
+	aesKey := sharedSecret[:32]
+	encrypted, nonce, err := encryptData(plaintext, aesKey)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Combine ML-KEM ciphertext with AES ciphertext
+	combined := append(ciphertext, encrypted...)
+	nonceB64 := base64.StdEncoding.EncodeToString(nonce[:])
+
+	// Zero the shared secret
+	SecureZero(sharedSecret[:])
+
+	return EncryptedData(combined), nonceB64, nil
+}
+
+// Decrypt data using ML-KEM-1024 + AES-256-GCM hybrid approach
+func decryptDataPQC(combined EncryptedData, decapsKeyBytes []byte, nonceB64 string) ([]byte, error) {
+	// Create the decapsulation key
+	decapsKey, err := mlkem.NewDecapsulationKey1024(decapsKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create decapsulation key: %w", err)
+	}
+	
+	// ML-KEM-1024 ciphertext is 1568 bytes
+	const mlkemCiphertextSize = 1568
+	if len(combined) < mlkemCiphertextSize {
+		return nil, fmt.Errorf("invalid ciphertext: too short (got %d bytes, need %d)", len(combined), mlkemCiphertextSize)
+	}
+
+	mlkemCiphertext := combined[:mlkemCiphertextSize]
+	aesCiphertext := combined[mlkemCiphertextSize:]
+
+	// Decapsulate to get shared secret
+	sharedSecret, err := decapsKey.Decapsulate(mlkemCiphertext)
+	if err != nil {
+		return nil, fmt.Errorf("ML-KEM decapsulation failed: %w", err)
+	}
+	defer SecureZero(sharedSecret[:])
+
+	// Decrypt with AES using first 32 bytes as key
+	aesKey := sharedSecret[:32]
+	nonceBytes, err := base64.StdEncoding.DecodeString(nonceB64)
+	if err != nil {
+		return nil, err
+	}
+
+	var nonce Nonce
+	copy(nonce[:], nonceBytes)
+
+	plaintext, err := decryptData(EncryptedData(aesCiphertext), aesKey, nonce)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
 // Encrypt data using AES-256-GCM
 func encryptData(plaintext []byte, key []byte) (EncryptedData, Nonce, error) {
 	block, err := aes.NewCipher(key)
@@ -229,7 +323,7 @@ func NewWalletManager(filePath string) *WalletManager {
 		filePath: filePath,
 		storage: &StorageFile{
 			Version:   "1.0",
-			Algorithm: "aes256gcm-argon2id",
+			Algorithm: "mlkem1024-aes256gcm",
 			Wallets:   []EncryptedWallet{},
 		},
 	}
@@ -237,14 +331,19 @@ func NewWalletManager(filePath string) *WalletManager {
 
 // Initialize or load storage
 func (wm *WalletManager) Initialize(password []byte) error {
+	// Store master password for re-authentication
+	wm.masterPassword = make([]byte, len(password))
+	copy(wm.masterPassword, password)
+
 	// Check if file exists
 	if _, err := os.Stat(wm.filePath); os.IsNotExist(err) {
-		// Create new storage
+		// Create new storage with post-quantum encryption
 		var salt Salt
 		if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
 			return fmt.Errorf("failed to generate salt: %w", err)
 		}
 
+		// Set up KDF parameters first
 		wm.storage.KDF = KDFParams{
 			Function:    "argon2id",
 			Memory:      65536,
@@ -254,7 +353,28 @@ func (wm *WalletManager) Initialize(password []byte) error {
 			KeyLen:      32,
 		}
 
+		// Derive the key using the KDF parameters
 		wm.key = deriveKey(password, salt, wm.storage.KDF)
+		
+		// Generate ML-KEM-1024 keypair
+		encapsKeyBytes, decapsKeyBytes, err := generateMLKEMKeyPair()
+		if err != nil {
+			return fmt.Errorf("failed to generate ML-KEM keypair: %w", err)
+		}
+		
+		// Encrypt the ML-KEM private key with AES using derived key
+		encryptedPrivKey, privKeyNonce, err := encryptData(decapsKeyBytes, wm.key)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt ML-KEM private key: %w", err)
+		}
+
+		// Store the encapsulation key (public key) and encrypted private key in the file
+		wm.storage.MLKEMPublicKey = base64.StdEncoding.EncodeToString(encapsKeyBytes)
+		wm.storage.MLKEMPrivateKeyEnc = base64.StdEncoding.EncodeToString(encryptedPrivKey)
+		wm.storage.MLKEMPrivateKeyNonce = base64.StdEncoding.EncodeToString(privKeyNonce[:])
+		
+		// Store the decrypted private key in memory
+		wm.mlkemPrivateKey = decapsKeyBytes
 		return wm.Save()
 	}
 
@@ -283,13 +403,72 @@ func (wm *WalletManager) Load(password []byte) error {
 	copy(s[:], salt)
 	wm.key = deriveKey(password, s, wm.storage.KDF)
 
-	// Verify by trying to decrypt first wallet
+	// Ensure this is a post-quantum format
+	if wm.storage.Algorithm != "mlkem1024-aes256gcm" {
+		return fmt.Errorf("unsupported storage format: %s. This wallet only supports ML-KEM post-quantum encryption", wm.storage.Algorithm)
+	}
+	
+	if wm.storage.MLKEMPublicKey == "" {
+		return fmt.Errorf("ML-KEM public key missing from storage file")
+	}
+
+	// Decrypt the stored ML-KEM private key
+	if wm.storage.MLKEMPrivateKeyEnc == "" || wm.storage.MLKEMPrivateKeyNonce == "" {
+		return fmt.Errorf("ML-KEM private key not found in storage")
+	}
+	
+	encryptedPrivKey, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyEnc)
+	if err != nil {
+		return fmt.Errorf("failed to decode encrypted ML-KEM private key: %w", err)
+	}
+	
+	privKeyNonceBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyNonce)
+	if err != nil {
+		return fmt.Errorf("failed to decode ML-KEM private key nonce: %w", err)
+	}
+	
+	var privKeyNonce Nonce
+	copy(privKeyNonce[:], privKeyNonceBytes)
+	
+	// Decrypt the ML-KEM private key using regular AES decryption (not hybrid ML-KEM)
+	decryptedPrivKey, err := decryptData(EncryptedData(encryptedPrivKey), wm.key, privKeyNonce)
+	if err != nil {
+		return fmt.Errorf("invalid password - failed to decrypt ML-KEM private key: %w", err)
+	}
+	
+	wm.mlkemPrivateKey = decryptedPrivKey
+	
+	// Verify the decrypted private key by checking public key match
+	encapsKeyBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPublicKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode stored ML-KEM public key: %w", err)
+	}
+	
+	// Derive the public key from our private key to verify correctness
+	decapsKey, err := mlkem.NewDecapsulationKey1024(wm.mlkemPrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to create decapsulation key: %w", err)
+	}
+	derivedEncapsKey := decapsKey.EncapsulationKey()
+	derivedEncapsKeyBytes := derivedEncapsKey.Bytes()
+	
+	// Verify the derived public key matches the stored one
+	if !SecureCompare(encapsKeyBytes, derivedEncapsKeyBytes) {
+		return errors.New("invalid password - ML-KEM key mismatch")
+	}
+	
+	// Successfully decrypted and verified ML-KEM private key
+
+	// Verify password by trying to decrypt first wallet (if any exist)
 	if len(wm.storage.Wallets) > 0 {
 		_, err := wm.decryptWallet(&wm.storage.Wallets[0])
 		if err != nil {
-			return errors.New("invalid password")
+			return fmt.Errorf("password verification failed: %w", err)
 		}
 	}
+	
+	// If no wallets exist yet, the password is considered valid
+	// (we already verified ML-KEM key decryption above)
 
 	return nil
 }
@@ -317,18 +496,29 @@ func (wm *WalletManager) Save() error {
 	return nil
 }
 
-// Add wallet to storage
+// Add wallet to storage using ML-KEM post-quantum encryption
 func (wm *WalletManager) AddWallet(wallet *Wallet) error {
-	// Encrypt private key
-	encrypted, nonce, err := encryptData(wallet.PrivateKey[:], wm.key)
+	// Ensure we have ML-KEM setup
+	if wm.storage.Algorithm != "mlkem1024-aes256gcm" || wm.storage.MLKEMPublicKey == "" {
+		return fmt.Errorf("ML-KEM encryption not initialized")
+	}
+
+	// Decode the ML-KEM public key
+	encapsKeyBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPublicKey)
 	if err != nil {
-		return fmt.Errorf("failed to encrypt key: %w", err)
+		return fmt.Errorf("failed to decode ML-KEM public key: %w", err)
+	}
+
+	// Use post-quantum encryption
+	encrypted, nonce, err := encryptDataPQC(wallet.PrivateKey[:], encapsKeyBytes)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt key with ML-KEM: %w", err)
 	}
 
 	ew := EncryptedWallet{
 		Address:      hex.EncodeToString(wallet.Address[:]),
 		EncryptedKey: base64.StdEncoding.EncodeToString(encrypted),
-		Nonce:        base64.StdEncoding.EncodeToString(nonce[:]),
+		Nonce:        nonce,
 		CreatedAt:    wallet.CreatedAt,
 		Label:        wallet.Label,
 	}
@@ -352,29 +542,31 @@ func (wm *WalletManager) ListWallets() ([]Wallet, error) {
 	return wallets, nil
 }
 
-// Decrypt wallet
+// Decrypt wallet using ML-KEM post-quantum decryption
 func (wm *WalletManager) decryptWallet(ew *EncryptedWallet) (*Wallet, error) {
+	// Ensure we have ML-KEM setup
+	if wm.storage.Algorithm != "mlkem1024-aes256gcm" {
+		return nil, fmt.Errorf("unsupported encryption algorithm: %s", wm.storage.Algorithm)
+	}
+	
+	if wm.mlkemPrivateKey == nil {
+		return nil, fmt.Errorf("ML-KEM private key not available")
+	}
+
 	encrypted, err := base64.StdEncoding.DecodeString(ew.EncryptedKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode encrypted key: %w", err)
 	}
 
-	nonceBytes, err := base64.StdEncoding.DecodeString(ew.Nonce)
+	// Use post-quantum decryption
+	decrypted, err := decryptDataPQC(EncryptedData(encrypted), wm.mlkemPrivateKey, ew.Nonce)
 	if err != nil {
-		return nil, err
-	}
-
-	var nonce Nonce
-	copy(nonce[:], nonceBytes)
-
-	decrypted, err := decryptData(EncryptedData(encrypted), wm.key, nonce)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ML-KEM decryption failed: %w", err)
 	}
 
 	addressBytes, err := hex.DecodeString(ew.Address)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode address: %w", err)
 	}
 
 	wallet := &Wallet{
@@ -390,25 +582,36 @@ func (wm *WalletManager) decryptWallet(ew *EncryptedWallet) (*Wallet, error) {
 // TUI Components
 
 type model struct {
-	list      list.Model
-	walletMgr *WalletManager
-	wallets   []Wallet
-	err       error
-	quitting  bool
-	input     textinput.Model
-	inputMode string
-	help      help.Model
-	keys      keyMap
+	list           list.Model
+	walletMgr      *WalletManager
+	wallets        []Wallet
+	filteredWallets []Wallet
+	err            error
+	quitting       bool
+	input          textinput.Model
+	passwordInput  textinput.Model
+	inputMode      string
+	searchQuery    string
+	help           help.Model
+	keys           keyMap
+	status         string
+	statusColor    lipgloss.Color
+	showingPrivateKey bool
+	selectedWallet *Wallet
 }
 
 type keyMap struct {
-	Up     key.Binding
-	Down   key.Binding
-	New    key.Binding
-	Delete key.Binding
-	Export key.Binding
-	Quit   key.Binding
-	Help   key.Binding
+	Up       key.Binding
+	Down     key.Binding
+	New      key.Binding
+	Delete   key.Binding
+	Export   key.Binding
+	Copy     key.Binding
+	Search   key.Binding
+	Quit     key.Binding
+	Help     key.Binding
+	Enter    key.Binding
+	Escape   key.Binding
 }
 
 var keys = keyMap{
@@ -430,7 +633,15 @@ var keys = keyMap{
 	),
 	Export: key.NewBinding(
 		key.WithKeys("e"),
-		key.WithHelp("e", "export"),
+		key.WithHelp("e", "export private key"),
+	),
+	Copy: key.NewBinding(
+		key.WithKeys("c"),
+		key.WithHelp("c", "copy address"),
+	),
+	Search: key.NewBinding(
+		key.WithKeys("/"),
+		key.WithHelp("/", "search"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
@@ -440,60 +651,174 @@ var keys = keyMap{
 		key.WithKeys("?"),
 		key.WithHelp("?", "help"),
 	),
+	Enter: key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("enter", "confirm"),
+	),
+	Escape: key.NewBinding(
+		key.WithKeys("esc"),
+		key.WithHelp("esc", "cancel"),
+	),
 }
 
 type item struct {
 	wallet Wallet
 }
 
-func (i item) FilterValue() string { return hex.EncodeToString(i.wallet.Address[:]) }
+// TUI Styles
+var (
+	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true)
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true)
+	warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true)
+	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#00AAFF")).Bold(true)
+	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Background(lipgloss.Color("#004400")).Bold(true)
+	headerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#444444")).Bold(true).Padding(0, 1)
+	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Italic(true)
+)
+
+func (i item) FilterValue() string { 
+	addr := hex.EncodeToString(i.wallet.Address[:])
+	return i.wallet.Label + " 0x" + addr
+}
+
 func (i item) Title() string {
 	addr := hex.EncodeToString(i.wallet.Address[:])
-	return "0x" + addr
+	addressStr := "0x" + addr
+	if i.wallet.Label != "" {
+		return fmt.Sprintf("%s (%s)", infoStyle.Render(i.wallet.Label), addressStr)
+	}
+	return addressStr
 }
+
 func (i item) Description() string {
 	label := i.wallet.Label
 	if label == "" {
-		label = "No label"
+		label = helpStyle.Render("No label")
 	}
-	return fmt.Sprintf("%s | Created: %s", label, i.wallet.CreatedAt.Format("2006-01-02"))
+	return fmt.Sprintf("%s | Created: %s", label, i.wallet.CreatedAt.Format("2006-01-02 15:04"))
+}
+
+// Initialize clipboard
+func initClipboard() error {
+	err := clipboard.Init()
+	if err != nil {
+		return fmt.Errorf("failed to initialize clipboard: %w", err)
+	}
+	return nil
+}
+
+// Copy to clipboard with timeout
+func copyToClipboard(text string, timeout time.Duration) error {
+	clipboard.Write(clipboard.FmtText, []byte(text))
+	
+	// Clear clipboard after timeout for sensitive data
+	if timeout > 0 {
+		go func() {
+			time.Sleep(timeout)
+			clipboard.Write(clipboard.FmtText, []byte(""))
+		}()
+	}
+	
+	return nil
+}
+
+// Filter wallets based on search query
+func filterWallets(wallets []Wallet, query string) []Wallet {
+	if query == "" {
+		return wallets
+	}
+	
+	query = strings.ToLower(query)
+	var filtered []Wallet
+	
+	for _, wallet := range wallets {
+		addr := strings.ToLower(hex.EncodeToString(wallet.Address[:]))
+		label := strings.ToLower(wallet.Label)
+		
+		if strings.Contains(addr, query) || strings.Contains(label, query) {
+			filtered = append(filtered, wallet)
+		}
+	}
+	
+	return filtered
 }
 
 func initialModel(walletMgr *WalletManager) model {
-	wallets, _ := walletMgr.ListWallets()
+	wallets, err := walletMgr.ListWallets()
+	if err != nil {
+		wallets = []Wallet{} // Empty list on error
+	}
+	
 	items := make([]list.Item, len(wallets))
 	for i, w := range wallets {
 		items[i] = item{wallet: w}
 	}
 
-	const defaultWidth = 20
-	const listHeight = 14
+	const defaultWidth = 80
+	const listHeight = 12
 
 	l := list.New(items, list.NewDefaultDelegate(), defaultWidth, listHeight)
-	l.Title = "Ethereum Wallets"
-	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(false)
-	l.Styles.Title = lipgloss.NewStyle().MarginLeft(2)
-	l.Styles.PaginationStyle = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
-	l.Styles.HelpStyle = list.DefaultStyles().HelpStyle.PaddingLeft(4).PaddingBottom(1)
+	l.Title = headerStyle.Render("🔒 Ethereum Quantum-Resistant Wallet Manager")
+	l.SetShowStatusBar(false) // Disable built-in status bar
+	l.SetFilteringEnabled(false) // We'll implement our own search
+	l.Styles.Title = headerStyle.MarginLeft(1).MarginBottom(1)
+	l.Styles.PaginationStyle = helpStyle.PaddingLeft(2)
+	l.Styles.HelpStyle = helpStyle.PaddingLeft(2)
 
+	// Input for wallet labels
 	ti := textinput.New()
-	ti.Placeholder = "Enter wallet label"
+	ti.Placeholder = "Enter wallet label..."
 	ti.CharLimit = 50
 	ti.Width = 50
 
+	// Password input for sensitive operations
+	pi := textinput.New()
+	pi.Placeholder = "Enter master password..."
+	pi.EchoMode = textinput.EchoPassword
+	pi.EchoCharacter = '*'
+	pi.CharLimit = 100
+	pi.Width = 50
+
 	return model{
-		list:      l,
-		walletMgr: walletMgr,
-		wallets:   wallets,
-		input:     ti,
-		help:      help.New(),
-		keys:      keys,
+		list:            l,
+		walletMgr:       walletMgr,
+		wallets:         wallets,
+		filteredWallets: wallets,
+		input:           ti,
+		passwordInput:   pi,
+		help:            help.New(),
+		keys:            keys,
+		status:          infoStyle.Render(fmt.Sprintf("Ready - %d wallet(s) loaded", len(wallets))),
+		statusColor:     "#00AAFF",
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return nil
+}
+
+// Helper function to refresh wallet list
+func (m model) refreshWalletList() model {
+	wallets, err := m.walletMgr.ListWallets()
+	if err != nil {
+		m.status = errorStyle.Render("❌ Failed to load wallets: " + err.Error())
+		return m
+	}
+	
+	m.wallets = wallets
+	m.filteredWallets = filterWallets(wallets, m.searchQuery)
+	
+	// Create new items and force list refresh
+	items := make([]list.Item, len(m.filteredWallets))
+	for i, w := range m.filteredWallets {
+		items[i] = item{wallet: w}
+	}
+	m.list.SetItems(items)
+	
+	// Also update the list title to show count
+	m.list.Title = headerStyle.Render(fmt.Sprintf("🔒 Ethereum Quantum-Resistant Wallet Manager (%d wallets)", len(wallets)))
+	
+	return m
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -503,38 +828,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Clear private key display on any key press
+		if m.showingPrivateKey {
+			m.showingPrivateKey = false
+			if m.selectedWallet != nil {
+				SecureZero(m.selectedWallet.PrivateKey[:])
+				m.selectedWallet = nil
+			}
+			m.status = infoStyle.Render("Private key cleared from memory")
+			return m, nil
+		}
+		// Handle input modes
 		if m.inputMode != "" {
 			switch msg.String() {
 			case "enter":
-				if m.inputMode == "new" {
+				switch m.inputMode {
+				case "new":
 					// Create new wallet with label
 					result := GenerateWallet()
 					if wallet, err := result.Unwrap(); err == nil {
 						wallet.Label = m.input.Value()
 						if err := m.walletMgr.AddWallet(wallet); err == nil {
-							// Reload wallets
-							m.wallets, _ = m.walletMgr.ListWallets()
-							items := make([]list.Item, len(m.wallets))
-							for i, w := range m.wallets {
-								items[i] = item{wallet: w}
-							}
-							m.list.SetItems(items)
+							// Reload wallets and refresh list
+							m = m.refreshWalletList()
+							addr := "0x" + hex.EncodeToString(wallet.Address[:])
+							m.status = successStyle.Render(fmt.Sprintf("✅ Wallet created! %s (%d total)", addr[:12]+"...", len(m.wallets)))
+							// Zero the private key in memory
+							SecureZero(wallet.PrivateKey[:])
+						} else {
+							m.status = errorStyle.Render("❌ Failed to save wallet: " + err.Error())
+						}
+					} else {
+						m.status = errorStyle.Render("❌ Failed to generate wallet: " + err.Error())
+					}
+				case "search":
+					m.searchQuery = m.input.Value()
+					m = m.refreshWalletList()
+					if m.searchQuery == "" {
+						m.status = infoStyle.Render("🔍 Search cleared - showing all wallets")
+					} else {
+						m.status = infoStyle.Render(fmt.Sprintf("🔍 Found %d wallet(s) matching '%s'", len(m.filteredWallets), m.searchQuery))
+					}
+				case "password":
+					// Verify password and show private key
+					if m.selectedWallet != nil {
+						password := m.passwordInput.Value()
+						if SecureCompare([]byte(password), m.walletMgr.masterPassword) {
+							m.showingPrivateKey = true
+							m.status = warningStyle.Render("Private key displayed - handle with care!")
+						} else {
+							m.status = errorStyle.Render("Invalid password")
 						}
 					}
 				}
 				m.inputMode = ""
 				m.input.SetValue("")
+				m.passwordInput.SetValue("")
 				return m, nil
 			case "esc":
 				m.inputMode = ""
 				m.input.SetValue("")
+				m.passwordInput.SetValue("")
+				m.showingPrivateKey = false
+				m.selectedWallet = nil
+				m.status = infoStyle.Render("Cancelled")
 				return m, nil
 			}
+			
+			// Update the appropriate input
 			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
+			if m.inputMode == "password" {
+				m.passwordInput, cmd = m.passwordInput.Update(msg)
+			} else {
+				m.input, cmd = m.input.Update(msg)
+			}
 			return m, cmd
 		}
 
+		// Handle main key bindings
 		switch {
 		case key.Matches(msg, m.keys.Quit):
 			m.quitting = true
@@ -542,19 +913,61 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, m.keys.New):
 			m.inputMode = "new"
+			m.input.Placeholder = "Enter wallet label (optional)..."
 			m.input.Focus()
+			m.status = infoStyle.Render("Creating new wallet...")
 			return m, textinput.Blink
 
+		case key.Matches(msg, m.keys.Search):
+			m.inputMode = "search"
+			m.input.Placeholder = "Search by label or address..."
+			m.input.Focus()
+			m.status = infoStyle.Render("Search mode - type to filter wallets")
+			return m, textinput.Blink
+
+		case key.Matches(msg, m.keys.Copy):
+			if len(m.filteredWallets) > 0 {
+				selectedIndex := m.list.Index()
+				if selectedIndex >= 0 && selectedIndex < len(m.filteredWallets) {
+					wallet := m.filteredWallets[selectedIndex]
+					addr := "0x" + hex.EncodeToString(wallet.Address[:])
+					if err := copyToClipboard(addr, 0); err == nil {
+						m.status = successStyle.Render("📋 Address copied: " + addr[:10] + "...")
+					} else {
+						m.status = errorStyle.Render("❌ Failed to copy address")
+					}
+				}
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to copy")
+			}
+			return m, nil
+
 		case key.Matches(msg, m.keys.Export):
+			if len(m.filteredWallets) > 0 {
+				selectedIndex := m.list.Index()
+				if selectedIndex >= 0 && selectedIndex < len(m.filteredWallets) {
+					wallet := m.filteredWallets[selectedIndex]
+					m.selectedWallet = &wallet
+					m.inputMode = "password"
+					m.passwordInput.Focus()
+					m.status = warningStyle.Render("🔐 Enter master password to view private key")
+					return m, textinput.Blink
+				}
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to export")
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Delete):
 			if i, ok := m.list.SelectedItem().(item); ok {
-				// In real implementation, show private key securely
-				fmt.Printf("\nAddress: 0x%s\n", hex.EncodeToString(i.wallet.Address[:]))
-				fmt.Printf("Private Key: 0x%s\n", hex.EncodeToString(i.wallet.PrivateKey[:]))
+				addr := "0x" + hex.EncodeToString(i.wallet.Address[:])
+				m.status = warningStyle.Render(fmt.Sprintf("Delete wallet %s? (y/N)", addr[:10]+"..."))
 			}
 			return m, nil
 		}
 	}
 
+	// Update list if not in input mode
 	if m.inputMode == "" {
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
@@ -566,41 +979,101 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	if m.quitting {
-		return "Goodbye!\n"
+		return successStyle.Render("👋 Goodbye! Stay secure!") + "\n"
 	}
 
+	// Handle input modes
 	if m.inputMode != "" {
+		var title, inputView, helpText string
+		
+		switch m.inputMode {
+		case "new":
+			title = headerStyle.Render("✨ Create New Wallet")
+			inputView = m.input.View()
+			helpText = helpStyle.Render("Enter to create • Esc to cancel")
+		case "search":
+			title = headerStyle.Render("🔍 Search Wallets")
+			inputView = m.input.View()
+			helpText = helpStyle.Render("Enter to search • Esc to cancel")
+		case "password":
+			title = errorStyle.Render("🔐 Authentication Required")
+			inputView = m.passwordInput.View()
+			helpText = helpStyle.Render("Enter master password • Esc to cancel")
+		}
+		
 		return fmt.Sprintf(
-			"Creating new wallet...\n\n%s\n\n%s",
-			m.input.View(),
-			"(esc to cancel)",
+			"%s\n\n%s\n\n%s\n\n%s",
+			title,
+			inputView,
+			helpText,
+			m.status,
 		) + "\n"
 	}
 
-	return "\n" + m.list.View()
+	// Show private key if authenticated
+	if m.showingPrivateKey && m.selectedWallet != nil {
+		privateKeyHex := "0x" + hex.EncodeToString(m.selectedWallet.PrivateKey[:])
+		addressHex := "0x" + hex.EncodeToString(m.selectedWallet.Address[:])
+		
+		view := fmt.Sprintf(
+			"%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n\n%s",
+			errorStyle.Render("⚠️  PRIVATE KEY - KEEP SECURE!"),
+			headerStyle.Render("Address:"),
+			infoStyle.Render(addressHex),
+			headerStyle.Render("Private Key:"),
+			errorStyle.Render(privateKeyHex),
+			warningStyle.Render("🔒 This private key controls your funds! Store it securely."),
+			helpStyle.Render("Press any key to continue..."),
+		)
+		
+		// Note: Private key will be cleared when user presses any key
+		
+		return view
+	}
+
+	// Main view
+	mainView := m.list.View()
+	
+	// Status section
+	statusSection := fmt.Sprintf("\n%s\n", m.status)
+	
+	// Help text
+	helpText := helpStyle.Render(
+		"n: new • c: copy address • e: export key • d: delete • /: search • q: quit",
+	)
+	
+	return fmt.Sprintf("%s%s%s", mainView, statusSection, helpText)
 }
 
 // Read password securely
 func readPassword(prompt string) ([]byte, error) {
 	fmt.Print(prompt)
+	
+	// Check if we're in a proper terminal
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		// Fallback for non-interactive environments
+		var password string
+		_, err := fmt.Scanln(&password)
+		fmt.Println()
+		return []byte(password), err
+	}
+	
 	password, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
 	return password, err
 }
 
 func main() {
-	// Check command line arguments
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: wallet <command>")
-		fmt.Println("Commands: new, list, browse")
-		os.Exit(1)
+	// Initialize clipboard
+	if err := initClipboard(); err != nil {
+		log.Printf("Warning: Clipboard not available: %v", err)
 	}
 
 	walletFile := "wallets.enc"
 	walletMgr := NewWalletManager(walletFile)
 
 	// Get master password
-	password, err := readPassword("Enter master password: ")
+	password, err := readPassword("🔐 Enter master password: ")
 	if err != nil {
 		log.Fatal("Failed to read password:", err)
 	}
@@ -616,58 +1089,13 @@ func main() {
 		log.Fatal("Failed to initialize wallet manager:", err)
 	}
 
-	switch os.Args[1] {
-	case "new":
-		result := GenerateWallet()
-		wallet, err := result.Unwrap()
-		if err != nil {
-			log.Fatal("Failed to generate wallet:", err)
-		}
-
-		fmt.Print("Enter wallet label (optional): ")
-		var label string
-		fmt.Scanln(&label)
-		wallet.Label = strings.TrimSpace(label)
-
-		if err := walletMgr.AddWallet(wallet); err != nil {
-			log.Fatal("Failed to save wallet:", err)
-		}
-
-		fmt.Printf("New wallet created!\n")
-		fmt.Printf("Address: 0x%s\n", hex.EncodeToString(wallet.Address[:]))
-		fmt.Printf("Private Key: 0x%s\n", hex.EncodeToString(wallet.PrivateKey[:]))
-		fmt.Println("\nIMPORTANT: Save your private key securely. It cannot be recovered!")
-
-		// Zero the private key in memory
-		for i := range wallet.PrivateKey {
-			wallet.PrivateKey[i] = 0
-		}
-
-	case "list":
-		wallets, err := walletMgr.ListWallets()
-		if err != nil {
-			log.Fatal("Failed to list wallets:", err)
-		}
-
-		fmt.Printf("Found %d wallet(s):\n\n", len(wallets))
-		for _, wallet := range wallets {
-			fmt.Printf("Address: 0x%s\n", hex.EncodeToString(wallet.Address[:]))
-			fmt.Printf("Label: %s\n", wallet.Label)
-			fmt.Printf("Created: %s\n", wallet.CreatedAt.Format("2006-01-02 15:04:05"))
-			fmt.Println("---")
-		}
-
-	case "browse":
-		p := tea.NewProgram(initialModel(walletMgr))
-		if _, err := p.Run(); err != nil {
-			log.Fatal("Failed to run TUI:", err)
-		}
-
-	default:
-		fmt.Printf("Unknown command: %s\n", os.Args[1])
-		os.Exit(1)
+	// Always launch TUI - all commands available within the interface
+	p := tea.NewProgram(initialModel(walletMgr), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Fatal("Failed to run TUI:", err)
 	}
 }
+
 
 // Additional security functions that would be in separate files in production
 

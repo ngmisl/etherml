@@ -1,4 +1,4 @@
-module etherml
+module wallet
 
 go 1.24.4
 
@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v0.25.0
 	github.com/charmbracelet/lipgloss v0.9.1
 	github.com/ethereum/go-ethereum v1.13.15
+	golang.design/x/clipboard v0.7.0
 	golang.org/x/crypto v0.17.0
 	golang.org/x/term v0.15.0
 )
@@ -28,6 +29,9 @@ require (
 	github.com/muesli/termenv v0.15.2 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
 	github.com/sahilm/fuzzy v0.1.1-0.20230530133925-c48e322e2a8f // indirect
+	golang.org/x/exp/shiny v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/image v0.14.0 // indirect
+	golang.org/x/mobile v0.0.0-20231127183840-76ac6878050a // indirect
 	golang.org/x/sync v0.5.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
