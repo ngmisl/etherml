@@ -1,6 +1,6 @@
 # Ethereum Wallet Manager
 
-A secure, quantum-resistant Ethereum wallet manager with a terminal user interface, written in Go 1.23+.
+A secure, quantum-resistant Ethereum wallet manager with a terminal user interface, written in Go 1.24.3+.
 
 ## 🌟 Features
 
@@ -22,7 +22,7 @@ A secure, quantum-resistant Ethereum wallet manager with a terminal user interfa
   - QR code display for addresses
 
 - 🚀 **Modern Go Features**
-  - Built with Go 1.23+
+  - Built with Go 1.24.3+
   - Strong typing with generics
   - Comprehensive error handling
   - Zero-dependency philosophy where possible
@@ -30,7 +30,7 @@ A secure, quantum-resistant Ethereum wallet manager with a terminal user interfa
 ## 🚀 Installation
 
 ### Prerequisites
-- Go 1.23 or higher
+- Go 1.24.3 or higher
 - Git
 
 ### From Source
