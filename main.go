@@ -542,6 +542,19 @@ func (wm *WalletManager) ListWallets() ([]Wallet, error) {
 	return wallets, nil
 }
 
+// Delete wallet from storage
+func (wm *WalletManager) DeleteWallet(address string) error {
+	// Find and remove the wallet with matching address
+	for i, ew := range wm.storage.Wallets {
+		if ew.Address == address {
+			// Remove wallet from slice
+			wm.storage.Wallets = append(wm.storage.Wallets[:i], wm.storage.Wallets[i+1:]...)
+			return wm.Save()
+		}
+	}
+	return fmt.Errorf("wallet with address %s not found", address)
+}
+
 // Decrypt wallet using ML-KEM post-quantum decryption
 func (wm *WalletManager) decryptWallet(ew *EncryptedWallet) (*Wallet, error) {
 	// Ensure we have ML-KEM setup
@@ -598,6 +611,8 @@ type model struct {
 	statusColor    lipgloss.Color
 	showingPrivateKey bool
 	selectedWallet *Wallet
+	confirmingDelete bool
+	walletToDelete *Wallet
 }
 
 type keyMap struct {
@@ -838,6 +853,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = infoStyle.Render("Private key cleared from memory")
 			return m, nil
 		}
+		
+		// Handle delete confirmation
+		if m.confirmingDelete {
+			switch msg.String() {
+			case "y", "Y":
+				if m.walletToDelete != nil {
+					addr := hex.EncodeToString(m.walletToDelete.Address[:])
+					if err := m.walletMgr.DeleteWallet(addr); err == nil {
+						m = m.refreshWalletList()
+						m.status = successStyle.Render(fmt.Sprintf("✅ Wallet deleted: 0x%s...", addr[:10]))
+					} else {
+						m.status = errorStyle.Render("❌ Failed to delete wallet: " + err.Error())
+					}
+				}
+				m.confirmingDelete = false
+				m.walletToDelete = nil
+				return m, nil
+			case "n", "N", "esc":
+				m.confirmingDelete = false
+				m.walletToDelete = nil
+				m.status = infoStyle.Render("Delete cancelled")
+				return m, nil
+			}
+			return m, nil
+		}
 		// Handle input modes
 		if m.inputMode != "" {
 			switch msg.String() {
@@ -959,9 +999,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case key.Matches(msg, m.keys.Delete):
-			if i, ok := m.list.SelectedItem().(item); ok {
-				addr := "0x" + hex.EncodeToString(i.wallet.Address[:])
-				m.status = warningStyle.Render(fmt.Sprintf("Delete wallet %s? (y/N)", addr[:10]+"..."))
+			if len(m.filteredWallets) > 0 {
+				selectedIndex := m.list.Index()
+				if selectedIndex >= 0 && selectedIndex < len(m.filteredWallets) {
+					wallet := m.filteredWallets[selectedIndex]
+					m.walletToDelete = &wallet
+					m.confirmingDelete = true
+					addr := "0x" + hex.EncodeToString(wallet.Address[:])
+					m.status = warningStyle.Render(fmt.Sprintf("❌ Delete wallet %s? (y/N)", addr[:10]+"..."))
+				}
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to delete")
 			}
 			return m, nil
 		}
@@ -1027,6 +1075,28 @@ func (m model) View() string {
 		)
 		
 		// Note: Private key will be cleared when user presses any key
+		
+		return view
+	}
+
+	// Show delete confirmation if active
+	if m.confirmingDelete && m.walletToDelete != nil {
+		addressHex := "0x" + hex.EncodeToString(m.walletToDelete.Address[:])
+		label := m.walletToDelete.Label
+		if label == "" {
+			label = "No label"
+		}
+		
+		view := fmt.Sprintf(
+			"%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n\n%s",
+			errorStyle.Render("⚠️  CONFIRM WALLET DELETION"),
+			headerStyle.Render("Address:"),
+			infoStyle.Render(addressHex),
+			headerStyle.Render("Label:"),
+			infoStyle.Render(label),
+			warningStyle.Render("⚠️ This action cannot be undone! The wallet and private key will be permanently deleted."),
+			helpStyle.Render("Press 'y' to confirm, 'n' or Esc to cancel"),
+		)
 		
 		return view
 	}
