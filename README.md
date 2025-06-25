@@ -148,4 +148,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
+## Donate
+
+[Click Here thanks!!](https://fourzerofour.fkey.id)
+
 > **Note**: This is a work in progress. Use at your own risk. Always keep backups of your private keys and never share them with anyone.
