@@ -1,5 +1,7 @@
 # Ethereum Wallet Manager
 
+[![CodeQL](https://github.com/ngmisl/etherml/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/ngmisl/etherml/actions/workflows/github-code-scanning/codeql) [![Go](https://github.com/ngmisl/etherml/actions/workflows/go.yml/badge.svg)](https://github.com/ngmisl/etherml/actions/workflows/go.yml)
+
 A secure, quantum-resistant Ethereum wallet manager with a terminal user interface, written in Go 1.24.3+.
 
 ## 🌟 Features
