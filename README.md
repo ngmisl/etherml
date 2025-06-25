@@ -1,9 +1,5 @@
 # Ethereum Wallet Manager
 
-[![Go Version](https://img.shields.io/github/go-mod/go-version/yourusername/ethereum-wallet-manager)](https://golang.org/)
-[![License](https://img.shields.io/github/license/yourusername/ethereum-wallet-manager)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yourusername/ethereum-wallet-manager)](https://goreportcard.com/report/github.com/yourusername/ethereum-wallet-manager)
-
 A secure, quantum-resistant Ethereum wallet manager with a terminal user interface, written in Go 1.23+.
 
 ## 🌟 Features
