@@ -653,6 +653,7 @@ type model struct {
 	loading           bool
 	loadingMsg        string
 	selectedIndex     int // Track selection for grid layout
+	editingWallet     *Wallet // Wallet currently being edited
 }
 
 type keyMap struct {
@@ -1200,6 +1201,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.status = errorStyle.Render("❌ Invalid password")
 						}
 					}
+				case "edit":
+					// Update wallet label
+					if m.editingWallet != nil {
+						newLabel := m.input.Value()
+						// Find the wallet in storage and update it
+						for i, ew := range m.walletMgr.storage.Wallets {
+							if strings.EqualFold(ew.Address, hex.EncodeToString(m.editingWallet.Address[:])) {
+								m.walletMgr.storage.Wallets[i].Label = newLabel
+								if err := m.walletMgr.Save(); err != nil {
+									m.status = errorStyle.Render("❌ Failed to save label: " + err.Error())
+								} else {
+									m.status = successStyle.Render(fmt.Sprintf("✅ Label updated: %s", newLabel))
+									m.refreshWalletList()
+								}
+								break
+							}
+						}
+						m.editingWallet = nil
+					}
 				}
 				m.inputMode = ""
 				m.input.SetValue("")
@@ -1211,6 +1231,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.passwordInput.SetValue("")
 				m.showingPrivateKey = false
 				m.selectedWallet = nil
+				m.editingWallet = nil
 				m.status = infoStyle.Render("❌ Cancelled")
 				return m, nil
 			}
@@ -1338,6 +1359,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = warningStyle.Render(fmt.Sprintf("⚠️ Delete wallet %s? (y/N)", formatAddress(addr)))
 			} else {
 				m.status = warningStyle.Render("⚠️ No wallets to delete")
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Enter):
+			if len(m.filteredWallets) > 0 && m.selectedIndex >= 0 && m.selectedIndex < len(m.filteredWallets) {
+				wallet := m.filteredWallets[m.selectedIndex]
+				m.editingWallet = &wallet
+				m.inputMode = "edit"
+				m.input.Placeholder = "Enter new label..."
+				m.input.SetValue(wallet.Label)
+				m.input.Focus()
+				m.status = infoStyle.Render("✏️ Editing wallet label - Enter to save, Esc to cancel")
+				return m, textinput.Blink
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to edit")
 			}
 			return m, nil
 
@@ -1477,6 +1513,11 @@ func (m model) View() string {
 			title = "Authentication Required"
 			inputView = m.passwordInput.View()
 			helpText = "Enter • Authenticate | Esc • Cancel"
+		case "edit":
+			icon = "✏️"
+			title = "Edit Wallet Label"
+			inputView = m.input.View()
+			helpText = "Enter • Save | Esc • Cancel"
 		}
 
 		content := lipgloss.JoinVertical(
@@ -1582,7 +1623,7 @@ func (m model) View() string {
 		lipgloss.NewStyle().Foreground(lipgloss.Color(subtext1Color)).Render(" • "),
 		lipgloss.NewStyle().Foreground(lipgloss.Color(textColor)).Render(walletCount),
 		lipgloss.NewStyle().Foreground(lipgloss.Color(subtext1Color)).Render(" • "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(mutedColor)).Render("n•new c•copy e•export d•delete /•search q•quit"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(mutedColor)).Render("n•new ⏎•edit c•copy e•export d•delete /•search q•quit"),
 	)
 	
 	// Add status message to header if present and not just ready message

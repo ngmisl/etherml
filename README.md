@@ -21,6 +21,7 @@ A **quantum-resistant** Ethereum wallet manager with post-quantum **ML-KEM-1024*
 - 💻 **Elegant Terminal Interface**
   - Beautiful TUI with professional styling and colors
   - Real-time search and filtering
+  - Inline wallet label editing
   - One-click address copying to clipboard
   - Modal dialogs for secure operations
   - Responsive design with proper scrolling
@@ -76,6 +77,7 @@ When prompted, enter your master password to unlock the encrypted wallet storage
 
 ### TUI Controls
 - **`n`** - Create new wallet with optional label
+- **`⏎`** - Edit wallet label (hover and press Enter)
 - **`c`** - Copy selected wallet address to clipboard  
 - **`e`** - Export private key (requires password re-authentication)
 - **`d`** - Delete wallet (with confirmation)
