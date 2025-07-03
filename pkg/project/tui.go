@@ -168,7 +168,7 @@ func (m ProjectTUIModel) Init() tea.Cmd {
 func (m *ProjectTUIModel) loadProjects() tea.Msg {
 	projects, err := m.manager.ListProjects()
 	if err != nil {
-		return ProjectErrorMsg{err}
+		return ProjectErrorMsg{fmt.Errorf("failed to list projects: %w", err)}
 	}
 	return ProjectsLoadedMsg{projects}
 }
@@ -217,7 +217,7 @@ func (m ProjectTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Update input models
 	if m.inputMode != "" {
 		var cmd tea.Cmd
-		if m.inputMode == "password" {
+		if m.inputMode == "password" || m.inputMode == "new_project_password" {
 			m.passwordInput, cmd = m.passwordInput.Update(msg)
 		} else {
 			m.input, cmd = m.input.Update(msg)
@@ -250,6 +250,20 @@ func (m ProjectTUIModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleInputMode handles input when in input mode
 func (m ProjectTUIModel) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle confirmation dialogs
+	if m.inputMode == "confirm_delete" || m.inputMode == "confirm_delete_wallet" {
+		switch msg.String() {
+		case "y", "Y":
+			return m.processInput()
+		case "n", "N", "esc":
+			m.inputMode = ""
+			m.status = "Cancelled"
+			return m, nil
+		}
+		return m, nil
+	}
+	
+	// Handle text input modes
 	switch msg.String() {
 	case "enter":
 		return m.processInput()
@@ -483,7 +497,7 @@ func (m *ProjectTUIModel) doCreateProject(name, password string) tea.Cmd {
 	return func() tea.Msg {
 		proj, err := m.manager.CreateProject(name, []byte(password))
 		if err != nil {
-			return ProjectErrorMsg{err}
+			return ProjectErrorMsg{fmt.Errorf("project creation failed for '%s': %w", name, err)}
 		}
 		
 		// Return success message with the created project
@@ -875,8 +889,27 @@ func (m ProjectTUIModel) renderProjectList() string {
 		content.WriteString("\n" + m.status)
 	}
 	
-	// Help
-	if m.inputMode == "" {
+	// Show input fields if in input mode
+	if m.inputMode == "new_project" {
+		content.WriteString("\n\n" + m.input.View())
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("⏎•confirm  esc•cancel"))
+	} else if m.inputMode == "new_project_password" {
+		content.WriteString("\n\n" + m.passwordInput.View())
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("⏎•confirm  esc•cancel"))
+	} else if m.inputMode == "password" {
+		content.WriteString("\n\n" + m.passwordInput.View())
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("⏎•confirm  esc•cancel"))
+	} else if m.inputMode == "confirm_delete" {
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("y•yes  n/esc•no"))
+	} else if m.inputMode == "" {
 		help := "\nn•new  ⏎•open  d•delete  q•quit"
 		content.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#6c7086")).
