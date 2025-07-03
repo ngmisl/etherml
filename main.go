@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,6 +29,8 @@ import (
 	"golang.design/x/clipboard"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/term"
+
+	"wallet/pkg/project"
 )
 
 // Type definitions for type safety
@@ -652,8 +655,13 @@ type model struct {
 	spinner           spinner.Model
 	loading           bool
 	loadingMsg        string
-	selectedIndex     int // Track selection for grid layout
+	selectedIndex     int     // Track selection for grid layout
 	editingWallet     *Wallet // Wallet currently being edited
+	// Project management
+	projectMgr     *project.Manager
+	projectMode    bool
+	currentProject project.Project
+	projectModel   tea.Model // Changed from *project.ProjectListModel to tea.Model
 }
 
 type keyMap struct {
@@ -664,6 +672,7 @@ type keyMap struct {
 	Export   key.Binding
 	Copy     key.Binding
 	Search   key.Binding
+	Projects key.Binding
 	Quit     key.Binding
 	Help     key.Binding
 	Enter    key.Binding
@@ -700,6 +709,10 @@ var keys = keyMap{
 	Search: key.NewBinding(
 		key.WithKeys("/"),
 		key.WithHelp("/", "search"),
+	),
+	Projects: key.NewBinding(
+		key.WithKeys("p"),
+		key.WithHelp("p", "projects"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
@@ -738,32 +751,32 @@ const (
 	secondaryColor = "#a6e3a1" // Green
 	accentColor    = "#fab387" // Peach
 	mauveColor     = "#cba6f7" // Mauve
-	
+
 	// Semantic colors
 	successColor = "#a6e3a1" // Green
 	warningColor = "#f9e2af" // Yellow
 	errorColor   = "#f38ba8" // Red
 	infoColor    = "#94e2d5" // Teal
-	
+
 	// Text colors
 	textColor     = "#cdd6f4" // Text
 	subtext1Color = "#bac2de" // Subtext1
 	subtext0Color = "#a6adc8" // Subtext0
-	
+
 	// Surface colors
-	bgColor      = "#1e1e2e" // Base
-	mantleColor  = "#181825" // Mantle
-	crustColor   = "#11111b" // Crust
-	cardBgColor  = "#313244" // Surface0
+	bgColor       = "#1e1e2e" // Base
+	mantleColor   = "#181825" // Mantle
+	crustColor    = "#11111b" // Crust
+	cardBgColor   = "#313244" // Surface0
 	surface1Color = "#45475a" // Surface1
 	surface2Color = "#585b70" // Surface2
-	
+
 	// Overlay colors
 	mutedColor    = "#6c7086" // Overlay0
 	overlay1Color = "#7f849c" // Overlay1
 	overlay2Color = "#9399b2" // Overlay2
 	borderColor   = "#45475a" // Surface1
-	
+
 	// Special colors
 	highlightColor = "#b4befe" // Lavender
 	rosewaterColor = "#f5e0dc" // Rosewater
@@ -982,7 +995,7 @@ func initialModel(walletMgr *WalletManager) model {
 	delegate.Styles.SelectedDesc = selectedCardStyle.Copy().Foreground(lipgloss.Color(crustColor))
 	delegate.Styles.NormalTitle = cardStyle
 	delegate.Styles.NormalDesc = mutedStyle
-	delegate.SetHeight(3) // Restore stable height for proper list calculations
+	delegate.SetHeight(3)  // Restore stable height for proper list calculations
 	delegate.SetSpacing(1) // Add spacing back for list component stability
 
 	l := list.New(items, delegate, defaultWidth, listHeight)
@@ -1019,6 +1032,11 @@ func initialModel(walletMgr *WalletManager) model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(primaryColor))
 
+	// Initialize project manager
+	homeDir, _ := os.UserHomeDir()
+	projectsDir := filepath.Join(homeDir, ".qwallet", "projects")
+	projectMgr := project.NewManager(projectsDir)
+
 	return model{
 		list:            l,
 		walletMgr:       walletMgr,
@@ -1032,6 +1050,9 @@ func initialModel(walletMgr *WalletManager) model {
 		statusColor:     lipgloss.Color(primaryColor),
 		spinner:         s,
 		selectedIndex:   0, // Initialize grid selection
+		projectMgr:      projectMgr,
+		projectMode:     false,
+		projectModel:    nil, // Initialize as nil
 	}
 }
 
@@ -1058,7 +1079,7 @@ func (m *model) refreshWalletList() {
 	for i, w := range m.filteredWallets {
 		items[i] = item{wallet: w}
 	}
-	
+
 	// Set items and reset selection to top
 	m.list.SetItems(items)
 	m.selectedIndex = 0 // Reset to top for grid layout
@@ -1080,7 +1101,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			availableHeight = 10
 		}
 		m.list.SetSize(msg.Width, availableHeight) // Full width for sheet appearance
-		return m, nil
+
+		// Update project model size if in project mode
+		if m.projectMode && m.projectModel != nil {
+			// Pass window size to whatever model is active
+			var cmd tea.Cmd
+			m.projectModel, cmd = m.projectModel.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
+		return m, tea.Batch(cmds...)
 
 	case loadingCompleteMsg:
 		m.loading = false
@@ -1095,6 +1125,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
+		// FIRST: Handle project mode - this must come before any other key handling
+		if m.projectMode && m.projectModel != nil {
+			var cmd tea.Cmd
+			// Pass all messages to the project model
+			m.projectModel, cmd = m.projectModel.Update(msg)
+
+			// Check if the project model has opened a project
+			if walletModel, ok := m.projectModel.(*project.ProjectWalletModel); ok {
+				m.currentProject = walletModel.GetProject()
+				m.projectModel = walletModel
+			}
+
+			// Check if model wants to quit (returns tea.Quit command)
+			if cmd != nil {
+				if _, ok := cmd().(tea.QuitMsg); ok {
+					// Return to main wallet view
+					m.projectMode = false
+					m.projectModel = nil
+					m.status = infoStyle.Render("🔙 Back to wallet view")
+					return m, nil
+				}
+			}
+
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
 		// Handle private key display interactions
 		if m.showingPrivateKey {
 			switch msg.String() {
@@ -1260,7 +1317,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if maxCols > 4 {
 					maxCols = 4
 				}
-				
+
 				newIndex := m.selectedIndex - maxCols
 				if newIndex < 0 {
 					newIndex = 0
@@ -1280,7 +1337,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if maxCols > 4 {
 					maxCols = 4
 				}
-				
+
 				newIndex := m.selectedIndex + maxCols
 				if newIndex >= len(m.filteredWallets) {
 					newIndex = len(m.filteredWallets) - 1
@@ -1377,6 +1434,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case key.Matches(msg, m.keys.Projects):
+			// Switch to project mode
+			m.projectMode = true
+			// Initialize project list model if not already done
+			if m.projectModel == nil {
+				projectListModel := project.NewProjectListModel(m.projectMgr)
+				m.projectModel = &projectListModel
+				// Pass current window size to the new model
+				if m.width > 0 && m.height > 0 {
+					projectListModel.SetSize(m.width, m.height)
+					m.projectModel = &projectListModel
+				}
+			}
+			m.status = infoStyle.Render("📁 Entering project mode...")
+			return m, nil
+
 		// Add a refresh key binding to reset list state if it gets stuck
 		case key.Matches(msg, key.NewBinding(key.WithKeys("r"))):
 			if m.inputMode == "" {
@@ -1420,27 +1493,27 @@ func (m model) renderWalletGrid() string {
 
 	actualWalletWidth := m.width / maxCols
 	selectedIndex := m.selectedIndex
-	
+
 	var rows []string
-	
+
 	for i := 0; i < len(m.filteredWallets); i += maxCols {
 		var columns []string
-		
+
 		for col := 0; col < maxCols && i+col < len(m.filteredWallets); col++ {
 			walletIndex := i + col
 			wallet := m.filteredWallets[walletIndex]
 			isSelected := walletIndex == selectedIndex
-			
+
 			// Format wallet entry
 			addr := hex.EncodeToString(wallet.Address[:])
 			addressStr := formatAddress(addr)
 			timeAgo := humanizeTime(wallet.CreatedAt)
-			
+
 			label := wallet.Label
 			if label == "" {
 				label = "Unlabeled Wallet"
 			}
-			
+
 			var walletContent string
 			if isSelected {
 				walletContent = selectedCardStyle.Copy().
@@ -1451,19 +1524,19 @@ func (m model) renderWalletGrid() string {
 					Width(actualWalletWidth - 2).
 					Render(fmt.Sprintf("🔐 %s\n📍 %s\n📅 %s", label, addressStr, timeAgo))
 			}
-			
+
 			columns = append(columns, walletContent)
 		}
-		
+
 		// Pad remaining columns if needed
 		for len(columns) < maxCols {
 			columns = append(columns, lipgloss.NewStyle().Width(actualWalletWidth-2).Render(""))
 		}
-		
+
 		row := lipgloss.JoinHorizontal(lipgloss.Top, columns...)
 		rows = append(rows, row)
 	}
-	
+
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
@@ -1478,6 +1551,20 @@ func (m model) View() string {
 			Render("👋 Stay secure with quantum-resistant encryption!")
 
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, farewell)
+	}
+
+	// Handle project mode
+	if m.projectMode {
+		if m.projectModel != nil {
+			return m.projectModel.View()
+		} else {
+			// Initialize project list model if not already done
+			return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+				lipgloss.NewStyle().
+					Foreground(lipgloss.Color(primaryColor)).
+					Bold(true).
+					Render("📁 Loading Projects..."))
+		}
 	}
 
 	// Handle loading state
@@ -1616,16 +1703,16 @@ func (m model) View() string {
 	if m.searchQuery != "" {
 		walletCount = fmt.Sprintf("🔍 %d/%d", len(m.filteredWallets), len(m.wallets))
 	}
-	
+
 	headerContent := lipgloss.JoinHorizontal(
 		lipgloss.Left,
 		lipgloss.NewStyle().Foreground(lipgloss.Color(primaryColor)).Bold(true).Render("🔐 Quantum Wallets"),
 		lipgloss.NewStyle().Foreground(lipgloss.Color(subtext1Color)).Render(" • "),
 		lipgloss.NewStyle().Foreground(lipgloss.Color(textColor)).Render(walletCount),
 		lipgloss.NewStyle().Foreground(lipgloss.Color(subtext1Color)).Render(" • "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(mutedColor)).Render("n•new ⏎•edit c•copy e•export d•delete /•search q•quit"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(mutedColor)).Render("n•new ⏎•edit c•copy e•export d•delete /•search p•projects q•quit"),
 	)
-	
+
 	// Add status message to header if present and not just ready message
 	if m.status != "" && !strings.Contains(m.status, "Ready") {
 		headerContent = lipgloss.JoinHorizontal(
@@ -1635,7 +1722,7 @@ func (m model) View() string {
 			m.status,
 		)
 	}
-	
+
 	compactHeader := lipgloss.NewStyle().
 		Background(lipgloss.Color(mantleColor)).
 		Foreground(lipgloss.Color(textColor)).
