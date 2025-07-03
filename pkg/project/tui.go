@@ -195,6 +195,21 @@ func (m ProjectTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Error: %s", msg.Err.Error())
 		return m, nil
 		
+	case ProjectCreatedMsg:
+		// Open the newly created project
+		m.currentProject = msg.Project
+		wallets, err := msg.Project.GetWallets()
+		if err != nil {
+			m.status = fmt.Sprintf("Failed to load wallets: %s", err.Error())
+			return m, nil
+		}
+		
+		m.wallets = wallets
+		m.state = ProjectWalletState
+		m.selectedIndex = 0
+		m.status = fmt.Sprintf("Created and opened project '%s'", msg.Name)
+		return m, nil
+		
 	case tea.KeyMsg:
 		return m.handleKeyPress(msg)
 	}
@@ -440,7 +455,7 @@ func (m ProjectTUIModel) processInput() (tea.Model, tea.Cmd) {
 // finalizeProjectCreation completes project creation with password
 func (m ProjectTUIModel) finalizeProjectCreation() (tea.Model, tea.Cmd) {
 	name := strings.TrimSpace(m.input.Value())
-	password := m.passwordInput.Value()
+	password := strings.TrimSpace(m.passwordInput.Value())
 	
 	if name == "" {
 		m.inputMode = ""
@@ -454,34 +469,26 @@ func (m ProjectTUIModel) finalizeProjectCreation() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	
-	// Create the project
-	proj, err := m.manager.CreateProject(name, []byte(password))
-	if err != nil {
-		m.inputMode = ""
-		m.status = fmt.Sprintf("Failed to create project: %s", err.Error())
-		m.input.SetValue("")
-		m.passwordInput.SetValue("")
-		return m, nil
-	}
-	
-	// Open the newly created project
-	m.currentProject = proj
-	wallets, err := proj.GetWallets()
-	if err != nil {
-		m.inputMode = ""
-		m.status = fmt.Sprintf("Failed to load wallets: %s", err.Error())
-		return m, nil
-	}
-	
-	m.wallets = wallets
-	m.state = ProjectWalletState
-	m.selectedIndex = 0
+	// Create the project asynchronously to avoid blocking UI
 	m.inputMode = ""
 	m.input.SetValue("")
 	m.passwordInput.SetValue("")
-	m.status = fmt.Sprintf("Created and opened project '%s'", name)
+	m.status = fmt.Sprintf("Creating project '%s'... (this may take a moment)", name)
 	
-	return m, nil
+	return m, m.doCreateProject(name, password)
+}
+
+// doCreateProject performs the actual project creation asynchronously
+func (m *ProjectTUIModel) doCreateProject(name, password string) tea.Cmd {
+	return func() tea.Msg {
+		proj, err := m.manager.CreateProject(name, []byte(password))
+		if err != nil {
+			return ProjectErrorMsg{err}
+		}
+		
+		// Return success message with the created project
+		return ProjectCreatedMsg{Project: proj, Name: name}
+	}
 }
 
 // createProject creates a new project
@@ -497,8 +504,7 @@ func (m ProjectTUIModel) createProject() (tea.Model, tea.Cmd) {
 	m.inputMode = "new_project_password"
 	m.passwordInput.Placeholder = "Enter password for new project..."
 	m.passwordInput.Focus()
-	// Store the project name temporarily in the input value for later use
-	// m.input.SetValue("") // Don't clear yet, we need the name
+	m.status = "Enter password for the new project..."
 	
 	return m, textinput.Blink
 }
@@ -510,6 +516,11 @@ type ProjectsLoadedMsg struct {
 
 type ProjectErrorMsg struct {
 	Err error
+}
+
+type ProjectCreatedMsg struct {
+	Project Project
+	Name    string
 }
 
 type ProjectOpenedMsg struct {
