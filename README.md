@@ -12,6 +12,20 @@ A **quantum-resistant** Ethereum wallet manager with post-quantum **ML-KEM-1024*
   - Future-proof against quantum computer attacks
   - No legacy encryption fallbacks - pure post-quantum always
 
+- 🔐 **Deniable Encryption**
+  - **Dual-password system** for plausible deniability
+  - **"$5 wrench password"** - shows convincing dummy wallets
+  - **Real password** - reveals actual wallet data
+  - Automatic password type detection
+  - Realistic decoy wallets with valid addresses
+
+- 📁 **Project-Based Organization**
+  - **Folder-like projects** for wallet organization
+  - **Bulk wallet creation** (1-100 wallets at once)
+  - **Mainnet/Testnet toggle** with spacebar
+  - **Wallet label editing** and network switching
+  - **Project-level encryption** with ML-KEM-1024
+
 - 🔐 **Advanced Cryptography**
   - Argon2id key derivation with secure parameters
   - Secure memory handling with automatic key zeroing
@@ -76,24 +90,53 @@ sudo dnf install libX11-devel
 When prompted, enter your master password to unlock the encrypted wallet storage.
 
 ### TUI Controls
+
+#### Main Wallet View
 - **`n`** - Create new wallet with optional label
 - **`⏎`** - Edit wallet label (hover and press Enter)
 - **`c`** - Copy selected wallet address to clipboard  
 - **`e`** - Export private key (requires password re-authentication)
 - **`d`** - Delete wallet (with confirmation)
 - **`/`** - Search wallets by label or address
+- **`p`** - Switch to project mode
 - **`↑/↓`** - Navigate wallet list
 - **`q`** - Quit application
+
+#### Project Mode
+- **`n`** - Create new project
+- **`⏎`** - Open selected project
+- **`d`** - Delete project (with confirmation)
+- **`b`** - Back to main wallet view
+- **`↑/↓`** - Navigate project list
+
+#### Inside Projects
+- **`n`** - Create single wallet
+- **`B`** - Bulk create wallets (1-100 with network toggle)
+- **`e`** - Edit wallet label
+- **`space`** - Toggle wallet network (mainnet/testnet)
+- **`c`** - Copy wallet address
+- **`x`** - Export private key
+- **`d`** - Delete wallet
+- **`b`** - Back to project list
 
 ### First Run
 1. Run `./wallet` 
 2. Create a strong master password (this encrypts all wallet data)
-3. Press `n` to create your first wallet
-4. Optionally add a label for easy identification
-5. Your wallet address and encrypted private key are now securely stored
+3. **Choose your usage pattern:**
+   - **Simple**: Press `n` to create individual wallets
+   - **Organized**: Press `p` for project mode, then `n` to create a project
+4. For projects: bulk create wallets with `B` and toggle networks with spacebar
+5. Your wallets are now securely stored with ML-KEM-1024 encryption
+
+### Deniable Encryption Setup
+1. Create your **real password** - protects your actual wallets
+2. Create a **decoy password** - shows convincing dummy wallets
+3. The application automatically detects which password you're using
+4. Decoy mode shows realistic but fake wallets for plausible deniability
 
 ### Security Notes
 - All private keys are encrypted with ML-KEM-1024 post-quantum encryption
+- Dual-password system provides plausible deniability against coercion
 - Master password is required to decrypt wallet data
 - Private keys are only decrypted in memory when explicitly requested
 - Memory is automatically zeroed after private key operations
@@ -103,50 +146,79 @@ When prompted, enter your master password to unlock the encrypted wallet storage
 ### Post-Quantum Encryption
 This wallet uses **ML-KEM-1024** (Module-Lattice-Based Key Encapsulation Mechanism), a NIST-standardized post-quantum cryptographic algorithm that remains secure even against quantum computer attacks.
 
-### Storage Format
+### Deniable Encryption Storage
+The wallet uses a dual-password system for plausible deniability:
+
 ```json
 {
   "version": "1.0",
   "algorithm": "mlkem1024-aes256gcm",
-  "kdf": {
-    "function": "argon2id",
-    "memory": 65536,
-    "iterations": 3,
-    "parallelism": 4,
-    "salt": "base64_encoded_salt",
-    "key_len": 32
+  
+  // Real password data
+  "kdf": { "function": "argon2id", "salt": "...", ... },
+  "mlkem_public_key": "real_public_key",
+  "mlkem_private_key_enc": "encrypted_real_private_key",
+  "encrypted_wallets": "real_wallet_data",
+  "hmac": "real_integrity_check",
+  
+  // Decoy password data  
+  "decoy_kdf": { "function": "argon2id", "salt": "...", ... },
+  "decoy_mlkem_public_key": "decoy_public_key", 
+  "decoy_mlkem_private_key_enc": "encrypted_decoy_private_key",
+  "decoy_encrypted_wallets": "dummy_wallet_data",
+  "decoy_hmac": "decoy_integrity_check",
+  
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+### Project Storage Format
+Each project is stored in its own directory with ML-KEM encryption:
+
+```json
+{
+  "version": "1.0",
+  "algorithm": "mlkem1024-aes256gcm",
+  "project_info": {
+    "name": "My Project",
+    "description": "Project: My Project",
+    "wallet_count": 25,
+    "mainnet_count": 10,
+    "testnet_count": 15,
+    "created_at": "2025-01-01T00:00:00Z"
   },
-  "mlkem_public_key": "base64_encoded_public_key",
-  "mlkem_private_key_enc": "base64_encoded_encrypted_private_key",
-  "mlkem_private_key_nonce": "base64_encoded_nonce", 
-  "wallets": [
-    {
-      "address": "hex_encoded_address",
-      "encrypted_key": "base64_mlkem_encrypted_private_key",
-      "nonce": "base64_encoded_nonce",
-      "created_at": "2025-01-01T00:00:00Z",
-      "label": "optional_label"
-    }
-  ]
+  "kdf": { "function": "argon2id", ... },
+  "mlkem_public_key": "project_public_key",
+  "encrypted_wallets": "project_wallet_data",
+  "hmac": "integrity_check"
 }
 ```
 
 ### Security Features
 - **Quantum Resistance**: ML-KEM-1024 provides 256-bit post-quantum security
+- **Deniable Encryption**: Dual-password system with realistic decoy wallets
+- **Plausible Deniability**: Automatic password detection, no indicators of real vs decoy
 - **Hybrid Encryption**: ML-KEM-1024 + AES-256-GCM for optimal performance
 - **Memory Safety**: Automatic zeroing of sensitive data after use
 - **Secure Key Derivation**: Argon2id with high memory requirements
+- **Project Isolation**: Each project uses separate encryption keys
 - **File Permissions**: Storage files created with 0600 permissions
 - **No Legacy Crypto**: Pure post-quantum encryption, no fallbacks
 
 ## 📚 Technical Details
 
 ### Architecture
-This is a single-file implementation designed for simplicity and security auditing:
+The wallet is organized into modular components for maintainability and security auditing:
 
-- **main.go** - Complete wallet implementation with ML-KEM encryption
+- **main.go** - Core wallet manager with deniable encryption
+- **pkg/project/** - Project-based wallet organization system
+  - **types.go** - Interface definitions and data structures  
+  - **manager.go** - Project CRUD operations and directory management
+  - **project_impl.go** - Project implementation with ML-KEM encryption
+  - **tui.go** - Project management terminal interface
 - **go.mod** - Dependencies (Bubble Tea TUI, Ethereum crypto, clipboard)
-- **wallets.enc** - Encrypted storage file (created on first run)
+- **wallets.enc** - Main encrypted storage file (dual-password)
+- **projects/** - Project directories (created as needed)
 
 ### Key Components
 - **ML-KEM Integration**: Uses Go 1.24.4's `crypto/mlkem` standard library
@@ -174,11 +246,15 @@ The wallet includes comprehensive error checking and will verify:
 
 ## 🛣️ Roadmap
 
+- [x] **Deniable Encryption** - Dual-password system with decoy wallets ✅
+- [x] **Project Organization** - Folder-based wallet management ✅
+- [x] **Bulk Creation** - Create 1-100 wallets with network toggle ✅
 - [ ] **Hardware Wallet Integration** - Ledger/Trezor support with post-quantum verification
 - [ ] **Multi-Signature Wallets** - ML-KEM-based threshold signatures
 - [ ] **Network Integration** - Direct Ethereum RPC interaction for balance/transactions
 - [ ] **Import/Export** - Support for standard wallet formats with PQ re-encryption
 - [ ] **Mobile App** - React Native app with Go mobile bindings
+- [ ] **Cloud Sync** - Encrypted cloud backup with ML-KEM
 
 ## 🤝 Contributing
 

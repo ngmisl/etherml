@@ -60,16 +60,27 @@ type EncryptedWallet struct {
 	Label        string    `json:"label,omitempty"`
 }
 
-// StorageFile represents the encrypted storage format
+// StorageFile represents the encrypted storage format with deniable encryption
 type StorageFile struct {
 	Version              string            `json:"version"`
 	Algorithm            string            `json:"algorithm"`
 	KDF                  KDFParams         `json:"kdf"`
+	
+	// Real wallet storage (opened with real password)
 	MLKEMPublicKey       string            `json:"mlkem_public_key,omitempty"`
 	MLKEMPrivateKeyEnc   string            `json:"mlkem_private_key_enc,omitempty"`
 	MLKEMPrivateKeyNonce string            `json:"mlkem_private_key_nonce,omitempty"`
 	EncryptedWallets     string            `json:"encrypted_wallets,omitempty"`
 	HMAC                 string            `json:"hmac,omitempty"`
+	
+	// Decoy wallet storage (opened with decoy password)
+	DecoyKDF             KDFParams         `json:"decoy_kdf"`
+	DecoyMLKEMPublicKey  string            `json:"decoy_mlkem_public_key,omitempty"`
+	DecoyMLKEMPrivateKeyEnc string         `json:"decoy_mlkem_private_key_enc,omitempty"`
+	DecoyMLKEMPrivateKeyNonce string       `json:"decoy_mlkem_private_key_nonce,omitempty"`
+	DecoyEncryptedWallets string           `json:"decoy_encrypted_wallets,omitempty"`
+	DecoyHMAC            string            `json:"decoy_hmac,omitempty"`
+	
 	Wallets              []EncryptedWallet `json:"wallets"` // Legacy support
 	UpdatedAt            time.Time         `json:"updated_at"`
 }
@@ -84,13 +95,23 @@ type KDFParams struct {
 	KeyLen      uint32 `json:"key_len"`
 }
 
-// WalletManager handles wallet operations
+// WalletMode represents which wallet set is active
+type WalletMode int
+
+const (
+	RealMode  WalletMode = iota // Real wallets (actual password)
+	DecoyMode                   // Decoy wallets ("$5 wrench" password)
+)
+
+// WalletManager handles wallet operations with deniable encryption
 type WalletManager struct {
 	filePath        string
 	storage         *StorageFile
 	key             []byte
 	mlkemPrivateKey []byte
 	masterPassword  []byte
+	mode            WalletMode // Current operating mode
+	isDecoySetup    bool       // Whether decoy wallets have been initialized
 }
 
 // Result type for error handling
@@ -351,6 +372,316 @@ func decryptData(ciphertext EncryptedData, key []byte, nonce Nonce) ([]byte, err
 	return plaintext, nil
 }
 
+// GenerateDummyWallets creates realistic-looking dummy wallets for decoy mode
+func GenerateDummyWallets(count int) []Wallet {
+	dummy := make([]Wallet, count)
+	baseTime := time.Now().Add(-30 * 24 * time.Hour) // 30 days ago
+	
+	labels := []string{
+		"Personal Wallet", "Trading Account", "DeFi Holdings", 
+		"NFT Collection", "Emergency Fund", "Investment Portfolio",
+		"Savings Account", "Gaming Wallet", "Test Wallet",
+	}
+	
+	for i := 0; i < count; i++ {
+		// Generate a realistic looking wallet
+		result := GenerateWallet()
+		if wallet, err := result.Unwrap(); err == nil {
+			// Add realistic creation times spread over the past month
+			wallet.CreatedAt = baseTime.Add(time.Duration(i*3) * 24 * time.Hour)
+			
+			// Add realistic labels
+			if i < len(labels) {
+				wallet.Label = labels[i]
+			} else {
+				wallet.Label = fmt.Sprintf("Wallet %d", i+1)
+			}
+			
+			dummy[i] = *wallet
+			
+			// Zero the original wallet memory for security
+			SecureZero(wallet.PrivateKey[:])
+		}
+	}
+	
+	return dummy
+}
+
+// initializeDecoyWallets sets up the decoy wallet system with dummy wallets
+func (wm *WalletManager) initializeDecoyWallets(decoyPassword []byte) error {
+	// Generate separate decoy KDF parameters with different salt
+	var decoySalt Salt
+	if _, err := io.ReadFull(rand.Reader, decoySalt[:]); err != nil {
+		return fmt.Errorf("failed to generate decoy salt: %w", err)
+	}
+	
+	wm.storage.DecoyKDF = KDFParams{
+		Function:    "argon2id",
+		Memory:      65536,
+		Iterations:  3,
+		Parallelism: 4,
+		Salt:        base64.StdEncoding.EncodeToString(decoySalt[:]),
+		KeyLen:      32,
+	}
+	
+	// Derive decoy key
+	decoyKey := deriveKey(decoyPassword, decoySalt, wm.storage.DecoyKDF)
+	defer SecureZero(decoyKey)
+	
+	// Generate separate ML-KEM keypair for decoy wallets
+	decoyEncapsKeyBytes, decoyDecapsKeyBytes, err := generateMLKEMKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to generate decoy ML-KEM keypair: %w", err)
+	}
+	defer SecureZero(decoyDecapsKeyBytes)
+	
+	// Encrypt the decoy ML-KEM private key
+	encryptedDecoyPrivKey, decoyPrivKeyNonce, err := encryptData(decoyDecapsKeyBytes, decoyKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt decoy ML-KEM private key: %w", err)
+	}
+	
+	// Store decoy ML-KEM keys
+	wm.storage.DecoyMLKEMPublicKey = base64.StdEncoding.EncodeToString(decoyEncapsKeyBytes)
+	wm.storage.DecoyMLKEMPrivateKeyEnc = base64.StdEncoding.EncodeToString(encryptedDecoyPrivKey)
+	wm.storage.DecoyMLKEMPrivateKeyNonce = base64.StdEncoding.EncodeToString(decoyPrivKeyNonce[:])
+	
+	// Generate dummy wallets
+	dummyWallets := GenerateDummyWallets(7) // Generate 7 dummy wallets
+	
+	// Encrypt dummy wallets using the decoy ML-KEM system
+	var encryptedDummyWallets []EncryptedWallet
+	for _, wallet := range dummyWallets {
+		encrypted, nonce, err := encryptDataPQC(wallet.PrivateKey[:], decoyEncapsKeyBytes)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt dummy wallet: %w", err)
+		}
+		
+		ew := EncryptedWallet{
+			Address:      hex.EncodeToString(wallet.Address[:]),
+			EncryptedKey: base64.StdEncoding.EncodeToString(encrypted),
+			Nonce:        nonce,
+			CreatedAt:    wallet.CreatedAt,
+			Label:        wallet.Label,
+		}
+		encryptedDummyWallets = append(encryptedDummyWallets, ew)
+		
+		// Zero the dummy wallet's private key
+		SecureZero(wallet.PrivateKey[:])
+	}
+	
+	// Serialize and encrypt the decoy wallet collection
+	decoyWalletData, err := json.Marshal(encryptedDummyWallets)
+	if err != nil {
+		return fmt.Errorf("failed to marshal decoy wallets: %w", err)
+	}
+	
+	encryptedDecoyData, decoyDataNonce, err := encryptDataPQC(decoyWalletData, decoyEncapsKeyBytes)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt decoy wallet data: %w", err)
+	}
+	
+	wm.storage.DecoyEncryptedWallets = base64.StdEncoding.EncodeToString(encryptedDecoyData)
+	wm.storage.DecoyHMAC = decoyDataNonce
+	
+	wm.isDecoySetup = true
+	return nil
+}
+
+// switchToDecoyMode switches the wallet manager to operate in decoy mode
+func (wm *WalletManager) switchToDecoyMode(decoyPassword []byte) error {
+	// Derive decoy key
+	decoySalt, err := base64.StdEncoding.DecodeString(wm.storage.DecoyKDF.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to decode decoy salt: %w", err)
+	}
+	
+	var s Salt
+	copy(s[:], decoySalt)
+	decoyKey := deriveKey(decoyPassword, s, wm.storage.DecoyKDF)
+	
+	// Decrypt decoy ML-KEM private key
+	encryptedDecoyPrivKey, err := base64.StdEncoding.DecodeString(wm.storage.DecoyMLKEMPrivateKeyEnc)
+	if err != nil {
+		SecureZero(decoyKey)
+		return fmt.Errorf("failed to decode decoy ML-KEM private key: %w", err)
+	}
+	
+	decoyPrivKeyNonceBytes, err := base64.StdEncoding.DecodeString(wm.storage.DecoyMLKEMPrivateKeyNonce)
+	if err != nil {
+		SecureZero(decoyKey)
+		return fmt.Errorf("failed to decode decoy ML-KEM private key nonce: %w", err)
+	}
+	
+	var decoyPrivKeyNonce Nonce
+	copy(decoyPrivKeyNonce[:], decoyPrivKeyNonceBytes)
+	
+	decoyMLKEMPrivateKey, err := decryptData(EncryptedData(encryptedDecoyPrivKey), decoyKey, decoyPrivKeyNonce)
+	if err != nil {
+		SecureZero(decoyKey)
+		return fmt.Errorf("invalid decoy password: %w", err)
+	}
+	
+	// Clear any existing real mode data and switch to decoy mode
+	SecureZero(wm.key)
+	if wm.mlkemPrivateKey != nil {
+		SecureZero(wm.mlkemPrivateKey)
+	}
+	
+	wm.key = decoyKey
+	wm.mlkemPrivateKey = decoyMLKEMPrivateKey
+	wm.mode = DecoyMode
+	
+	// Store decoy password for re-authentication
+	if wm.masterPassword != nil {
+		SecureZero(wm.masterPassword)
+	}
+	wm.masterPassword = make([]byte, len(decoyPassword))
+	copy(wm.masterPassword, decoyPassword)
+	
+	return nil
+}
+
+// tryDecoyPassword attempts to authenticate with the provided password as a decoy password
+func (wm *WalletManager) tryDecoyPassword(password []byte) bool {
+	if wm.storage.DecoyKDF.Salt == "" {
+		return false // No decoy system setup
+	}
+	
+	// Try to derive decoy key and decrypt decoy ML-KEM private key
+	decoySalt, err := base64.StdEncoding.DecodeString(wm.storage.DecoyKDF.Salt)
+	if err != nil {
+		return false
+	}
+	
+	var s Salt
+	copy(s[:], decoySalt)
+	decoyKey := deriveKey(password, s, wm.storage.DecoyKDF)
+	defer SecureZero(decoyKey)
+	
+	// Try to decrypt decoy ML-KEM private key
+	encryptedDecoyPrivKey, err := base64.StdEncoding.DecodeString(wm.storage.DecoyMLKEMPrivateKeyEnc)
+	if err != nil {
+		return false
+	}
+	
+	decoyPrivKeyNonceBytes, err := base64.StdEncoding.DecodeString(wm.storage.DecoyMLKEMPrivateKeyNonce)
+	if err != nil {
+		return false
+	}
+	
+	var decoyPrivKeyNonce Nonce
+	copy(decoyPrivKeyNonce[:], decoyPrivKeyNonceBytes)
+	
+	_, err = decryptData(EncryptedData(encryptedDecoyPrivKey), decoyKey, decoyPrivKeyNonce)
+	return err == nil
+}
+
+// tryRealPassword attempts to authenticate with the provided password as the real password
+func (wm *WalletManager) tryRealPassword(password []byte) bool {
+	if wm.storage.KDF.Salt == "" {
+		return false // No real system setup
+	}
+	
+	// Try to derive real key and decrypt real ML-KEM private key
+	salt, err := base64.StdEncoding.DecodeString(wm.storage.KDF.Salt)
+	if err != nil {
+		return false
+	}
+	
+	var s Salt
+	copy(s[:], salt)
+	realKey := deriveKey(password, s, wm.storage.KDF)
+	defer SecureZero(realKey)
+	
+	// Try to decrypt real ML-KEM private key
+	encryptedPrivKey, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyEnc)
+	if err != nil {
+		return false
+	}
+	
+	privKeyNonceBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyNonce)
+	if err != nil {
+		return false
+	}
+	
+	var privKeyNonce Nonce
+	copy(privKeyNonce[:], privKeyNonceBytes)
+	
+	_, err = decryptData(EncryptedData(encryptedPrivKey), realKey, privKeyNonce)
+	return err == nil
+}
+
+// detectPasswordType determines whether the provided password is real or decoy
+func (wm *WalletManager) detectPasswordType(password []byte) WalletMode {
+	// First check if it's a real password
+	if wm.tryRealPassword(password) {
+		return RealMode
+	}
+	
+	// Then check if it's a decoy password
+	if wm.tryDecoyPassword(password) {
+		return DecoyMode
+	}
+	
+	// If neither works, default to real mode (this will cause an error later)
+	return RealMode
+}
+
+// switchToRealMode switches the wallet manager to operate in real mode
+func (wm *WalletManager) switchToRealMode(realPassword []byte) error {
+	// Derive real key
+	salt, err := base64.StdEncoding.DecodeString(wm.storage.KDF.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to decode salt: %w", err)
+	}
+	
+	var s Salt
+	copy(s[:], salt)
+	realKey := deriveKey(realPassword, s, wm.storage.KDF)
+	
+	// Decrypt real ML-KEM private key
+	encryptedPrivKey, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyEnc)
+	if err != nil {
+		SecureZero(realKey)
+		return fmt.Errorf("failed to decode ML-KEM private key: %w", err)
+	}
+	
+	privKeyNonceBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyNonce)
+	if err != nil {
+		SecureZero(realKey)
+		return fmt.Errorf("failed to decode ML-KEM private key nonce: %w", err)
+	}
+	
+	var privKeyNonce Nonce
+	copy(privKeyNonce[:], privKeyNonceBytes)
+	
+	realMLKEMPrivateKey, err := decryptData(EncryptedData(encryptedPrivKey), realKey, privKeyNonce)
+	if err != nil {
+		SecureZero(realKey)
+		return fmt.Errorf("invalid real password: %w", err)
+	}
+	
+	// Clear any existing decoy mode data and switch to real mode
+	SecureZero(wm.key)
+	if wm.mlkemPrivateKey != nil {
+		SecureZero(wm.mlkemPrivateKey)
+	}
+	
+	wm.key = realKey
+	wm.mlkemPrivateKey = realMLKEMPrivateKey
+	wm.mode = RealMode
+	
+	// Store real password for re-authentication
+	if wm.masterPassword != nil {
+		SecureZero(wm.masterPassword)
+	}
+	wm.masterPassword = make([]byte, len(realPassword))
+	copy(wm.masterPassword, realPassword)
+	
+	return nil
+}
+
 // NewWalletManager creates a new wallet manager
 func NewWalletManager(filePath string) *WalletManager {
 	return &WalletManager{
@@ -360,24 +691,23 @@ func NewWalletManager(filePath string) *WalletManager {
 			Algorithm: "mlkem1024-aes256gcm",
 			Wallets:   []EncryptedWallet{},
 		},
+		mode:         RealMode, // Default to real mode
+		isDecoySetup: false,
 	}
 }
 
-// Initialize or load storage
+// Initialize or load storage with dual-password support
 func (wm *WalletManager) Initialize(password []byte) error {
-	// Store master password for re-authentication
-	wm.masterPassword = make([]byte, len(password))
-	copy(wm.masterPassword, password)
-
 	// Check if file exists
 	if _, err := os.Stat(wm.filePath); os.IsNotExist(err) {
-		// Create new storage with post-quantum encryption
+		// NEW FILE: Set up both real and decoy encryption systems
+		
+		// Set up real wallet system (actual password)
 		var salt Salt
 		if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
 			return fmt.Errorf("failed to generate salt: %w", err)
 		}
 
-		// Set up KDF parameters first
 		wm.storage.KDF = KDFParams{
 			Function:    "argon2id",
 			Memory:      65536,
@@ -387,36 +717,55 @@ func (wm *WalletManager) Initialize(password []byte) error {
 			KeyLen:      32,
 		}
 
-		// Derive the key using the KDF parameters
+		// Derive the real key
 		wm.key = deriveKey(password, salt, wm.storage.KDF)
 
-		// Generate ML-KEM-1024 keypair
+		// Generate real ML-KEM keypair
 		encapsKeyBytes, decapsKeyBytes, err := generateMLKEMKeyPair()
 		if err != nil {
-			return fmt.Errorf("failed to generate ML-KEM keypair: %w", err)
+			return fmt.Errorf("failed to generate real ML-KEM keypair: %w", err)
 		}
 
-		// Encrypt the ML-KEM private key with AES using derived key
+		// Encrypt the real ML-KEM private key
 		encryptedPrivKey, privKeyNonce, err := encryptData(decapsKeyBytes, wm.key)
 		if err != nil {
-			return fmt.Errorf("failed to encrypt ML-KEM private key: %w", err)
+			return fmt.Errorf("failed to encrypt real ML-KEM private key: %w", err)
 		}
 
-		// Store the encapsulation key (public key) and encrypted private key in the file
+		// Store real ML-KEM keys
 		wm.storage.MLKEMPublicKey = base64.StdEncoding.EncodeToString(encapsKeyBytes)
 		wm.storage.MLKEMPrivateKeyEnc = base64.StdEncoding.EncodeToString(encryptedPrivKey)
 		wm.storage.MLKEMPrivateKeyNonce = base64.StdEncoding.EncodeToString(privKeyNonce[:])
 
-		// Store the decrypted private key in memory
+		// Store the real private key in memory
 		wm.mlkemPrivateKey = decapsKeyBytes
+
+		// Prompt for decoy password and set up decoy system
+		fmt.Print(infoStyle.Render("🔐 For deniable encryption, enter a different decoy password: "))
+		decoyPassword, err := readPassword("")
+		if err != nil {
+			return fmt.Errorf("failed to read decoy password: %w", err)
+		}
+		defer SecureZero(decoyPassword)
+
+		// Initialize decoy wallet system
+		if err := wm.initializeDecoyWallets(decoyPassword); err != nil {
+			return fmt.Errorf("failed to initialize decoy wallets: %w", err)
+		}
+
+		// Store real password for re-authentication and set mode
+		wm.masterPassword = make([]byte, len(password))
+		copy(wm.masterPassword, password)
+		wm.mode = RealMode
+
 		return wm.Save()
 	}
 
-	// Load existing storage
+	// EXISTING FILE: Load and detect which password type is being used
 	return wm.Load(password)
 }
 
-// Load storage file
+// Load storage file with dual-password detection
 func (wm *WalletManager) Load(password []byte) error {
 	data, err := os.ReadFile(wm.filePath)
 	if err != nil {
@@ -427,82 +776,41 @@ func (wm *WalletManager) Load(password []byte) error {
 		return fmt.Errorf("failed to unmarshal storage: %w", err)
 	}
 
-	// Derive key
-	salt, err := base64.StdEncoding.DecodeString(wm.storage.KDF.Salt)
-	if err != nil {
-		return fmt.Errorf("failed to decode salt: %w", err)
-	}
-
-	var s Salt
-	copy(s[:], salt)
-	wm.key = deriveKey(password, s, wm.storage.KDF)
-
 	// Ensure this is a post-quantum format
 	if wm.storage.Algorithm != "mlkem1024-aes256gcm" {
 		return fmt.Errorf("unsupported storage format: %s. This wallet only supports ML-KEM post-quantum encryption", wm.storage.Algorithm)
 	}
 
-	if wm.storage.MLKEMPublicKey == "" {
-		return fmt.Errorf("ML-KEM public key missing from storage file")
-	}
+	// CRITICAL: Detect which password type is being used
+	passwordType := wm.detectPasswordType(password)
 
-	// Decrypt the stored ML-KEM private key
-	if wm.storage.MLKEMPrivateKeyEnc == "" || wm.storage.MLKEMPrivateKeyNonce == "" {
-		return fmt.Errorf("ML-KEM private key not found in storage")
-	}
-
-	encryptedPrivKey, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyEnc)
-	if err != nil {
-		return fmt.Errorf("failed to decode encrypted ML-KEM private key: %w", err)
-	}
-
-	privKeyNonceBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPrivateKeyNonce)
-	if err != nil {
-		return fmt.Errorf("failed to decode ML-KEM private key nonce: %w", err)
-	}
-
-	var privKeyNonce Nonce
-	copy(privKeyNonce[:], privKeyNonceBytes)
-
-	// Decrypt the ML-KEM private key using regular AES decryption (not hybrid ML-KEM)
-	decryptedPrivKey, err := decryptData(EncryptedData(encryptedPrivKey), wm.key, privKeyNonce)
-	if err != nil {
-		return fmt.Errorf("invalid password - failed to decrypt ML-KEM private key: %w", err)
-	}
-
-	wm.mlkemPrivateKey = decryptedPrivKey
-
-	// Verify the decrypted private key by checking public key match
-	encapsKeyBytes, err := base64.StdEncoding.DecodeString(wm.storage.MLKEMPublicKey)
-	if err != nil {
-		return fmt.Errorf("failed to decode stored ML-KEM public key: %w", err)
-	}
-
-	// Derive the public key from our private key to verify correctness
-	decapsKey, err := mlkem.NewDecapsulationKey1024(wm.mlkemPrivateKey)
-	if err != nil {
-		return fmt.Errorf("failed to create decapsulation key: %w", err)
-	}
-	derivedEncapsKey := decapsKey.EncapsulationKey()
-	derivedEncapsKeyBytes := derivedEncapsKey.Bytes()
-
-	// Verify the derived public key matches the stored one
-	if !SecureCompare(encapsKeyBytes, derivedEncapsKeyBytes) {
-		return errors.New("invalid password - ML-KEM key mismatch")
-	}
-
-	// Successfully decrypted and verified ML-KEM private key
-
-	// Verify password by trying to decrypt first wallet (if any exist)
-	if len(wm.storage.Wallets) > 0 {
-		_, err := wm.decryptWallet(&wm.storage.Wallets[0])
-		if err != nil {
-			return fmt.Errorf("password verification failed: %w", err)
+	switch passwordType {
+	case RealMode:
+		// User entered the real password - load real wallets
+		if err := wm.switchToRealMode(password); err != nil {
+			return fmt.Errorf("failed to load real wallets: %w", err)
 		}
-	}
+		
+		// Verify real password by trying to decrypt first real wallet (if any exist)
+		if len(wm.storage.Wallets) > 0 {
+			_, err := wm.decryptWallet(&wm.storage.Wallets[0])
+			if err != nil {
+				return fmt.Errorf("real password verification failed: %w", err)
+			}
+		}
 
-	// If no wallets exist yet, the password is considered valid
-	// (we already verified ML-KEM key decryption above)
+	case DecoyMode:
+		// User entered the decoy password - load decoy wallets
+		if err := wm.switchToDecoyMode(password); err != nil {
+			return fmt.Errorf("failed to load decoy wallets: %w", err)
+		}
+		
+		// Clear real wallets from memory to maintain deniability
+		wm.storage.Wallets = []EncryptedWallet{}
+
+	default:
+		return fmt.Errorf("invalid password - authentication failed")
+	}
 
 	return nil
 }
@@ -561,8 +869,14 @@ func (wm *WalletManager) AddWallet(wallet *Wallet) error {
 	return wm.Save()
 }
 
-// List all wallets
+// List all wallets (real or decoy depending on current mode)
 func (wm *WalletManager) ListWallets() ([]Wallet, error) {
+	if wm.mode == DecoyMode {
+		// Return decoy wallets when in decoy mode
+		return wm.listDecoyWallets()
+	}
+
+	// Return real wallets when in real mode
 	wallets := make([]Wallet, 0, len(wm.storage.Wallets))
 
 	for _, ew := range wm.storage.Wallets {
@@ -574,6 +888,73 @@ func (wm *WalletManager) ListWallets() ([]Wallet, error) {
 	}
 
 	return wallets, nil
+}
+
+// listDecoyWallets returns the dummy wallets for decoy mode
+func (wm *WalletManager) listDecoyWallets() ([]Wallet, error) {
+	if wm.storage.DecoyEncryptedWallets == "" {
+		return []Wallet{}, nil // No decoy wallets setup
+	}
+
+	// Decrypt the decoy wallet collection
+	encryptedDecoyData, err := base64.StdEncoding.DecodeString(wm.storage.DecoyEncryptedWallets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode decoy wallet data: %w", err)
+	}
+
+	decoyWalletData, err := decryptDataPQC(EncryptedData(encryptedDecoyData), wm.mlkemPrivateKey, wm.storage.DecoyHMAC)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt decoy wallet collection: %w", err)
+	}
+
+	// Unmarshal the encrypted wallet list
+	var encryptedDecoyWallets []EncryptedWallet
+	if err := json.Unmarshal(decoyWalletData, &encryptedDecoyWallets); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal decoy wallets: %w", err)
+	}
+
+	// Decrypt each decoy wallet
+	var wallets []Wallet
+	for _, ew := range encryptedDecoyWallets {
+		wallet, err := wm.decryptDecoyWallet(&ew)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt decoy wallet %s: %w", ew.Address, err)
+		}
+		wallets = append(wallets, *wallet)
+	}
+
+	return wallets, nil
+}
+
+// decryptDecoyWallet decrypts a single decoy wallet
+func (wm *WalletManager) decryptDecoyWallet(ew *EncryptedWallet) (*Wallet, error) {
+	encrypted, err := base64.StdEncoding.DecodeString(ew.EncryptedKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode encrypted key: %w", err)
+	}
+
+	// Use decoy ML-KEM decryption
+	decrypted, err := decryptDataPQC(EncryptedData(encrypted), wm.mlkemPrivateKey, ew.Nonce)
+	if err != nil {
+		return nil, fmt.Errorf("decoy ML-KEM decryption failed: %w", err)
+	}
+
+	addressBytes, err := hex.DecodeString(ew.Address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode address: %w", err)
+	}
+
+	wallet := &Wallet{
+		CreatedAt: ew.CreatedAt,
+		Label:     ew.Label,
+	}
+	copy(wallet.PrivateKey[:], decrypted)
+	copy(wallet.Address[:], addressBytes)
+
+	// Zero the decrypted key data
+	SecureZero(decrypted)
+
+	return wallet, nil
 }
 
 // Delete wallet from storage
@@ -657,11 +1038,11 @@ type model struct {
 	loadingMsg        string
 	selectedIndex     int     // Track selection for grid layout
 	editingWallet     *Wallet // Wallet currently being edited
+	
 	// Project management
-	projectMgr     *project.Manager
+	projectMgr     project.ProjectManager
 	projectMode    bool
-	currentProject project.Project
-	projectModel   tea.Model // Changed from *project.ProjectListModel to tea.Model
+	projectModel   tea.Model
 }
 
 type keyMap struct {
@@ -1052,7 +1433,7 @@ func initialModel(walletMgr *WalletManager) model {
 		selectedIndex:   0, // Initialize grid selection
 		projectMgr:      projectMgr,
 		projectMode:     false,
-		projectModel:    nil, // Initialize as nil
+		projectModel:    nil,
 	}
 }
 
@@ -1104,7 +1485,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Update project model size if in project mode
 		if m.projectMode && m.projectModel != nil {
-			// Pass window size to whatever model is active
 			var cmd tea.Cmd
 			m.projectModel, cmd = m.projectModel.Update(msg)
 			cmds = append(cmds, cmd)
@@ -1125,29 +1505,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
-		// FIRST: Handle project mode - this must come before any other key handling
+		// Handle project mode first
 		if m.projectMode && m.projectModel != nil {
 			var cmd tea.Cmd
-			// Pass all messages to the project model
 			m.projectModel, cmd = m.projectModel.Update(msg)
-
-			// Check if the project model has opened a project
-			if walletModel, ok := m.projectModel.(*project.ProjectWalletModel); ok {
-				m.currentProject = walletModel.GetProject()
-				m.projectModel = walletModel
-			}
-
-			// Check if model wants to quit (returns tea.Quit command)
+			
+			// Check if project model wants to quit back to main
 			if cmd != nil {
 				if _, ok := cmd().(tea.QuitMsg); ok {
-					// Return to main wallet view
 					m.projectMode = false
 					m.projectModel = nil
 					m.status = infoStyle.Render("🔙 Back to wallet view")
 					return m, nil
 				}
 			}
-
+			
 			cmds = append(cmds, cmd)
 			return m, tea.Batch(cmds...)
 		}
@@ -1437,14 +1809,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Projects):
 			// Switch to project mode
 			m.projectMode = true
-			// Initialize project list model if not already done
 			if m.projectModel == nil {
-				projectListModel := project.NewProjectListModel(m.projectMgr)
-				m.projectModel = &projectListModel
-				// Pass current window size to the new model
+				m.projectModel = project.NewProjectTUIModel(m.projectMgr)
+				// Initialize with current window size
 				if m.width > 0 && m.height > 0 {
-					projectListModel.SetSize(m.width, m.height)
-					m.projectModel = &projectListModel
+					m.projectModel, _ = m.projectModel.Update(tea.WindowSizeMsg{
+						Width:  m.width,
+						Height: m.height,
+					})
 				}
 			}
 			m.status = infoStyle.Render("📁 Entering project mode...")
@@ -1558,7 +1930,6 @@ func (m model) View() string {
 		if m.projectModel != nil {
 			return m.projectModel.View()
 		} else {
-			// Initialize project list model if not already done
 			return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
 				lipgloss.NewStyle().
 					Foreground(lipgloss.Color(primaryColor)).
