@@ -17,48 +17,51 @@ type ProjectTUIModel struct {
 	projects       []ProjectInfo
 	currentProject Project
 	wallets        []ProjectWallet
-	
+
 	// UI state
-	state          ProjectTUIState
-	selectedIndex  int
-	width          int
-	height         int
-	
+	state         ProjectTUIState
+	selectedIndex int
+	width         int
+	height        int
+
 	// Input handling
-	input          textinput.Model
-	passwordInput  textinput.Model
-	inputMode      string
-	
+	input         textinput.Model
+	inputMode     string
+
+	// Master password from main app
+	masterPassword []byte
+
 	// Bulk creation state
-	bulkConfig     BulkConfig
-	bulkPreview    []*ProjectWallet
-	
+	bulkConfig  BulkConfig
+	bulkPreview []*ProjectWallet
+
 	// Status and errors
-	status         string
-	err            error
-	
+	status     string
+	err        error
+	isCreating bool
+
 	// Key bindings
-	keys           ProjectKeyMap
-	help           help.Model
+	keys ProjectKeyMap
+	help help.Model
 }
 
 // ProjectKeyMap defines key bindings for project TUI
 type ProjectKeyMap struct {
-	Up           key.Binding
-	Down         key.Binding
-	Left         key.Binding
-	Right        key.Binding
-	Enter        key.Binding
-	Back         key.Binding
-	New          key.Binding
-	Delete       key.Binding
-	Edit         key.Binding
-	Copy         key.Binding
-	Export       key.Binding
-	Bulk         key.Binding
-	Toggle       key.Binding
-	Help         key.Binding
-	Quit         key.Binding
+	Up     key.Binding
+	Down   key.Binding
+	Left   key.Binding
+	Right  key.Binding
+	Enter  key.Binding
+	Back   key.Binding
+	New    key.Binding
+	Delete key.Binding
+	Edit   key.Binding
+	Copy   key.Binding
+	Export key.Binding
+	Bulk   key.Binding
+	Toggle key.Binding
+	Help   key.Binding
+	Quit   key.Binding
 }
 
 // DefaultProjectKeys returns the default key bindings
@@ -128,26 +131,18 @@ func DefaultProjectKeys() ProjectKeyMap {
 }
 
 // NewProjectTUIModel creates a new project TUI model
-func NewProjectTUIModel(manager ProjectManager) *ProjectTUIModel {
+func NewProjectTUIModel(manager ProjectManager, masterPassword []byte) *ProjectTUIModel {
 	// Create text inputs
 	input := textinput.New()
 	input.Placeholder = "Enter project name..."
 	input.CharLimit = 50
 	input.Width = 50
-	
-	passwordInput := textinput.New()
-	passwordInput.Placeholder = "Enter project password..."
-	passwordInput.EchoMode = textinput.EchoPassword
-	passwordInput.EchoCharacter = '•'
-	passwordInput.CharLimit = 100
-	passwordInput.Width = 50
-	
+
 	return &ProjectTUIModel{
 		manager:       manager,
 		state:         ProjectListState,
 		selectedIndex: 0,
 		input:         input,
-		passwordInput: passwordInput,
 		keys:          DefaultProjectKeys(),
 		help:          help.New(),
 		bulkConfig: BulkConfig{
@@ -156,75 +151,89 @@ func NewProjectTUIModel(manager ProjectManager) *ProjectTUIModel {
 			NetworkConfig: make(map[int]NetworkType),
 			AutoLabel:     true,
 		},
+		masterPassword: masterPassword,
 	}
+}
 }
 
 // Init initializes the model
 func (m ProjectTUIModel) Init() tea.Cmd {
-	return m.loadProjects
+	return m.loadProjects()
 }
 
-// loadProjects loads the project list
-func (m *ProjectTUIModel) loadProjects() tea.Msg {
-	projects, err := m.manager.ListProjects()
-	if err != nil {
-		return ProjectErrorMsg{fmt.Errorf("failed to list projects: %w", err)}
+// loadProjects loads the project list asynchronously
+func (m ProjectTUIModel) loadProjects() tea.Cmd {
+	return func() tea.Msg {
+		// Add recovery for any panics
+		var result tea.Msg
+		defer func() {
+			if r := recover(); r != nil {
+				// Send error message on panic
+				result = ProjectErrorMsg{fmt.Errorf("project loading panicked: %v", r)}
+			}
+		}()
+
+		projects, err := m.manager.ListProjects()
+		if err != nil {
+			result = ProjectErrorMsg{fmt.Errorf("failed to list projects: %w", err)}
+		} else {
+			result = ProjectsLoadedMsg{projects}
+		}
+
+		return result
 	}
-	return ProjectsLoadedMsg{projects}
 }
 
 // Update handles messages and updates the model
 func (m ProjectTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
-	
+
+	// Update input models first to ensure proper input handling
+	if m.inputMode != "" {
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
-		
+
 	case ProjectsLoadedMsg:
 		m.projects = msg.Projects
 		if len(m.projects) > 0 && m.selectedIndex >= len(m.projects) {
 			m.selectedIndex = len(m.projects) - 1
 		}
 		return m, nil
-		
+
 	case ProjectErrorMsg:
 		m.err = msg.Err
+		m.isCreating = false
 		m.status = fmt.Sprintf("Error: %s", msg.Err.Error())
 		return m, nil
-		
+
 	case ProjectCreatedMsg:
 		// Open the newly created project
 		m.currentProject = msg.Project
+		m.isCreating = false
 		wallets, err := msg.Project.GetWallets()
 		if err != nil {
 			m.status = fmt.Sprintf("Failed to load wallets: %s", err.Error())
 			return m, nil
 		}
-		
+
 		m.wallets = wallets
 		m.state = ProjectWalletState
 		m.selectedIndex = 0
 		m.status = fmt.Sprintf("Created and opened project '%s'", msg.Name)
 		return m, nil
-		
+
 	case tea.KeyMsg:
 		return m.handleKeyPress(msg)
 	}
-	
-	// Update input models
-	if m.inputMode != "" {
-		var cmd tea.Cmd
-		if m.inputMode == "password" || m.inputMode == "new_project_password" {
-			m.passwordInput, cmd = m.passwordInput.Update(msg)
-		} else {
-			m.input, cmd = m.input.Update(msg)
-		}
-		cmds = append(cmds, cmd)
-	}
-	
+
 	return m, tea.Batch(cmds...)
 }
 
@@ -234,7 +243,7 @@ func (m ProjectTUIModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.inputMode != "" {
 		return m.handleInputMode(msg)
 	}
-	
+
 	// Handle different states
 	switch m.state {
 	case ProjectListState:
@@ -244,7 +253,7 @@ func (m ProjectTUIModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case BulkCreateState:
 		return m.handleBulkCreateKeys(msg)
 	}
-	
+
 	return m, nil
 }
 
@@ -262,7 +271,7 @@ func (m ProjectTUIModel) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	
+
 	// Handle text input modes
 	switch msg.String() {
 	case "enter":
@@ -270,11 +279,16 @@ func (m ProjectTUIModel) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.inputMode = ""
 		m.input.SetValue("")
-		m.passwordInput.SetValue("")
+		m.input.Blur()
 		m.status = "Cancelled"
 		return m, nil
 	}
-	return m, nil
+
+	// Update the appropriate input model
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+
+	return m, cmd
 }
 
 // handleProjectListKeys handles keys in project list state
@@ -285,40 +299,39 @@ func (m ProjectTUIModel) handleProjectListKeys(msg tea.KeyMsg) (tea.Model, tea.C
 			m.selectedIndex--
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Down):
 		if len(m.projects) > 0 && m.selectedIndex < len(m.projects)-1 {
 			m.selectedIndex++
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Enter):
 		if len(m.projects) > 0 {
-			m.inputMode = "password"
-			m.passwordInput.Placeholder = "Enter password to open project..."
-			m.passwordInput.Focus()
-			m.status = "Opening project..."
+			return m.openProject()
 		}
-		return m, textinput.Blink
-		
+		return m, nil
+
 	case key.Matches(msg, m.keys.New):
 		m.inputMode = "new_project"
 		m.input.Placeholder = "Enter new project name..."
+		m.input.SetValue("")
 		m.input.Focus()
+		m.passwordInput.Blur()
 		m.status = "Creating new project..."
 		return m, textinput.Blink
-		
+
 	case key.Matches(msg, m.keys.Delete):
 		if len(m.projects) > 0 {
 			m.inputMode = "confirm_delete"
 			m.status = fmt.Sprintf("Delete project '%s'? (y/N)", m.projects[m.selectedIndex].Name)
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
 	}
-	
+
 	return m, nil
 }
 
@@ -330,13 +343,13 @@ func (m ProjectTUIModel) handleWalletListKeys(msg tea.KeyMsg) (tea.Model, tea.Cm
 			m.selectedIndex--
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Down):
 		if len(m.wallets) > 0 && m.selectedIndex < len(m.wallets)-1 {
 			m.selectedIndex++
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Back):
 		m.state = ProjectListState
 		m.selectedIndex = 0
@@ -344,21 +357,22 @@ func (m ProjectTUIModel) handleWalletListKeys(msg tea.KeyMsg) (tea.Model, tea.Cm
 			m.currentProject.Lock()
 			m.currentProject = nil
 		}
-		return m, m.loadProjects
-		
+		return m, m.loadProjects()
+
 	case key.Matches(msg, m.keys.New):
 		m.inputMode = "new_wallet"
 		m.input.Placeholder = "Enter wallet label..."
+		m.input.SetValue("")
 		m.input.Focus()
 		m.status = "Creating new wallet..."
 		return m, textinput.Blink
-		
+
 	case key.Matches(msg, m.keys.Bulk):
 		m.state = BulkCreateState
 		m.selectedIndex = 0
 		m.status = "Bulk wallet creation mode"
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Edit):
 		if len(m.wallets) > 0 {
 			m.inputMode = "edit_wallet"
@@ -368,37 +382,37 @@ func (m ProjectTUIModel) handleWalletListKeys(msg tea.KeyMsg) (tea.Model, tea.Cm
 			m.status = "Editing wallet label..."
 		}
 		return m, textinput.Blink
-		
+
 	case key.Matches(msg, m.keys.Toggle):
 		if len(m.wallets) > 0 {
 			return m.toggleWalletNetwork()
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Copy):
 		if len(m.wallets) > 0 {
 			// Copy address to clipboard (would need clipboard implementation)
 			m.status = "Address copied to clipboard"
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Export):
 		if len(m.wallets) > 0 {
 			return m.exportWallet()
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Delete):
 		if len(m.wallets) > 0 {
 			m.inputMode = "confirm_delete_wallet"
 			m.status = fmt.Sprintf("Delete wallet '%s'? (y/N)", m.wallets[m.selectedIndex].Label)
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
 	}
-	
+
 	return m, nil
 }
 
@@ -410,13 +424,13 @@ func (m ProjectTUIModel) handleBulkCreateKeys(msg tea.KeyMsg) (tea.Model, tea.Cm
 			m.selectedIndex--
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Down):
 		if m.selectedIndex < m.bulkConfig.Count-1 {
 			m.selectedIndex++
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Toggle):
 		// Toggle network for selected wallet
 		currentNetwork := m.bulkConfig.NetworkConfig[m.selectedIndex]
@@ -426,20 +440,20 @@ func (m ProjectTUIModel) handleBulkCreateKeys(msg tea.KeyMsg) (tea.Model, tea.Cm
 			m.bulkConfig.NetworkConfig[m.selectedIndex] = Mainnet
 		}
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Enter):
 		// Create wallets
 		return m.createBulkWallets()
-		
+
 	case key.Matches(msg, m.keys.Back):
 		m.state = ProjectWalletState
 		m.selectedIndex = 0
 		return m, nil
-		
+
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
 	}
-	
+
 	return m, nil
 }
 
@@ -448,10 +462,6 @@ func (m ProjectTUIModel) processInput() (tea.Model, tea.Cmd) {
 	switch m.inputMode {
 	case "new_project":
 		return m.createProject()
-	case "new_project_password":
-		return m.finalizeProjectCreation()
-	case "password":
-		return m.openProject()
 	case "new_wallet":
 		return m.createWallet()
 	case "edit_wallet":
@@ -461,47 +471,34 @@ func (m ProjectTUIModel) processInput() (tea.Model, tea.Cmd) {
 	case "confirm_delete_wallet":
 		return m.confirmDeleteWallet()
 	}
-	
+
 	m.inputMode = ""
 	return m, nil
 }
 
-// finalizeProjectCreation completes project creation with password
-func (m ProjectTUIModel) finalizeProjectCreation() (tea.Model, tea.Cmd) {
-	name := strings.TrimSpace(m.input.Value())
-	password := strings.TrimSpace(m.passwordInput.Value())
-	
-	if name == "" {
-		m.inputMode = ""
-		m.status = "Project name cannot be empty"
-		return m, nil
-	}
-	
-	if password == "" {
-		m.inputMode = ""
-		m.status = "Password cannot be empty"
-		return m, nil
-	}
-	
-	// Create the project asynchronously to avoid blocking UI
-	m.inputMode = ""
-	m.input.SetValue("")
-	m.passwordInput.SetValue("")
-	m.status = fmt.Sprintf("Creating project '%s'... (this may take a moment)", name)
-	
-	return m, m.doCreateProject(name, password)
-}
+
 
 // doCreateProject performs the actual project creation asynchronously
-func (m *ProjectTUIModel) doCreateProject(name, password string) tea.Cmd {
+func (m ProjectTUIModel) doCreateProject(name string) tea.Cmd {
 	return func() tea.Msg {
-		proj, err := m.manager.CreateProject(name, []byte(password))
+		// Add recovery for any panics
+		var result tea.Msg
+		defer func() {
+			if r := recover(); r != nil {
+				// Send error message on panic
+				result = ProjectErrorMsg{fmt.Errorf("project creation panicked: %v", r)}
+			}
+		}()
+
+		proj, err := m.manager.CreateProject(name, m.masterPassword)
 		if err != nil {
-			return ProjectErrorMsg{fmt.Errorf("project creation failed for '%s': %w", name, err)}
+			result = ProjectErrorMsg{fmt.Errorf("project creation failed for '%s': %w", name, err)}
+		} else {
+			// Success message with the created project
+			result = ProjectCreatedMsg{Project: proj, Name: name}
 		}
-		
-		// Return success message with the created project
-		return ProjectCreatedMsg{Project: proj, Name: name}
+
+		return result
 	}
 }
 
@@ -513,14 +510,34 @@ func (m ProjectTUIModel) createProject() (tea.Model, tea.Cmd) {
 		m.inputMode = ""
 		return m, nil
 	}
-	
-	// Switch to password input
-	m.inputMode = "new_project_password"
-	m.passwordInput.Placeholder = "Enter password for new project..."
-	m.passwordInput.Focus()
-	m.status = "Enter password for the new project..."
-	
-	return m, textinput.Blink
+
+	// Validate project name
+	if len(name) < 3 {
+		m.status = "Project name must be at least 3 characters"
+		return m, nil
+	}
+
+	if len(name) > 50 {
+		m.status = "Project name must be 50 characters or less"
+		return m, nil
+	}
+
+	// Check for invalid characters
+	for _, char := range name {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == ' ') {
+			m.status = "Project name can only contain letters, numbers, spaces, hyphens, and underscores"
+			return m, nil
+		}
+	}
+
+	// Create the project
+	m.inputMode = ""
+	m.input.SetValue("")
+	m.input.Blur()
+	m.isCreating = true
+	m.status = fmt.Sprintf("Creating project '%s'...", name)
+
+	return m, m.doCreateProject(name)
 }
 
 // Message types for async operations
@@ -545,26 +562,24 @@ type WalletsLoadedMsg struct {
 	Wallets []ProjectWallet
 }
 
-// openProject opens the selected project with password
+// openProject opens the selected project
 func (m ProjectTUIModel) openProject() (tea.Model, tea.Cmd) {
 	if len(m.projects) == 0 || m.selectedIndex >= len(m.projects) {
 		m.inputMode = ""
 		m.status = "No project selected"
 		return m, nil
 	}
-	
-	password := m.passwordInput.Value()
+
 	projectName := m.projects[m.selectedIndex].Name
-	
+
 	// Try to open the project
-	proj, err := m.manager.OpenProject(projectName, []byte(password))
+	proj, err := m.manager.OpenProject(projectName, m.masterPassword)
 	if err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to open project: %s", err.Error())
-		m.passwordInput.SetValue("")
 		return m, nil
 	}
-	
+
 	// Load wallets from project
 	wallets, err := proj.GetWallets()
 	if err != nil {
@@ -572,31 +587,45 @@ func (m ProjectTUIModel) openProject() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to load wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Switch to wallet view
 	m.currentProject = proj
 	m.wallets = wallets
 	m.state = ProjectWalletState
 	m.selectedIndex = 0
 	m.inputMode = ""
-	m.passwordInput.SetValue("")
 	m.status = fmt.Sprintf("Opened project '%s' with %d wallets", projectName, len(wallets))
-	
+
 	return m, nil
 }
 
 func (m ProjectTUIModel) createWallet() (tea.Model, tea.Cmd) {
 	if m.currentProject == nil {
 		m.inputMode = ""
+		m.input.Blur()
 		m.status = "No project selected"
 		return m, nil
 	}
-	
+
 	label := strings.TrimSpace(m.input.Value())
 	if label == "" {
 		label = fmt.Sprintf("Wallet %d", len(m.wallets)+1)
+	} else {
+		// Validate wallet label
+		if len(label) > 100 {
+			m.status = "Wallet label must be 100 characters or less"
+			return m, nil
+		}
+
+		// Check for duplicate labels
+		for _, wallet := range m.wallets {
+			if wallet.Label == label {
+				m.status = "Wallet label must be unique"
+				return m, nil
+			}
+		}
 	}
-	
+
 	// Create new wallet (default to testnet)
 	wallet, err := m.currentProject.CreateWallet(label, Testnet)
 	if err != nil {
@@ -604,14 +633,14 @@ func (m ProjectTUIModel) createWallet() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to create wallet: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Save the project
 	if err := m.currentProject.Save(); err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to save project: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Reload wallets
 	wallets, err := m.currentProject.GetWallets()
 	if err != nil {
@@ -619,46 +648,63 @@ func (m ProjectTUIModel) createWallet() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to reload wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	m.wallets = wallets
 	m.inputMode = ""
 	m.input.SetValue("")
+	m.input.Blur()
 	m.status = fmt.Sprintf("Created wallet '%s' at 0x%x", wallet.Label, wallet.Address[:4])
-	
+
 	return m, nil
 }
 
 func (m ProjectTUIModel) editWallet() (tea.Model, tea.Cmd) {
 	if m.currentProject == nil || len(m.wallets) == 0 || m.selectedIndex >= len(m.wallets) {
 		m.inputMode = ""
+		m.input.Blur()
 		m.status = "No wallet selected"
 		return m, nil
 	}
-	
+
 	newLabel := strings.TrimSpace(m.input.Value())
 	if newLabel == "" {
 		m.inputMode = ""
+		m.input.Blur()
 		m.status = "Label cannot be empty"
 		return m, nil
 	}
-	
+
+	// Validate wallet label
+	if len(newLabel) > 100 {
+		m.status = "Wallet label must be 100 characters or less"
+		return m, nil
+	}
+
+	// Check for duplicate labels (excluding current wallet)
+	for i, wallet := range m.wallets {
+		if i != m.selectedIndex && wallet.Label == newLabel {
+			m.status = "Wallet label must be unique"
+			return m, nil
+		}
+	}
+
 	wallet := m.wallets[m.selectedIndex]
 	address := fmt.Sprintf("%x", wallet.Address[:])
-	
+
 	// Update wallet label
 	if err := m.currentProject.EditWallet(address, newLabel, wallet.Network); err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to edit wallet: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Save project
 	if err := m.currentProject.Save(); err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to save project: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Reload wallets
 	wallets, err := m.currentProject.GetWallets()
 	if err != nil {
@@ -666,12 +712,13 @@ func (m ProjectTUIModel) editWallet() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to reload wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	m.wallets = wallets
 	m.inputMode = ""
 	m.input.SetValue("")
+	m.input.Blur()
 	m.status = fmt.Sprintf("Updated wallet label to '%s'", newLabel)
-	
+
 	return m, nil
 }
 
@@ -680,38 +727,38 @@ func (m ProjectTUIModel) toggleWalletNetwork() (tea.Model, tea.Cmd) {
 		m.status = "No wallet selected"
 		return m, nil
 	}
-	
+
 	wallet := m.wallets[m.selectedIndex]
 	address := fmt.Sprintf("%x", wallet.Address[:])
-	
+
 	// Toggle network
 	newNetwork := Testnet
 	if wallet.Network == Testnet {
 		newNetwork = Mainnet
 	}
-	
+
 	// Update wallet network
 	if err := m.currentProject.EditWallet(address, wallet.Label, newNetwork); err != nil {
 		m.status = fmt.Sprintf("Failed to toggle network: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Save project
 	if err := m.currentProject.Save(); err != nil {
 		m.status = fmt.Sprintf("Failed to save project: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Reload wallets
 	wallets, err := m.currentProject.GetWallets()
 	if err != nil {
 		m.status = fmt.Sprintf("Failed to reload wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	m.wallets = wallets
 	m.status = fmt.Sprintf("Toggled '%s' to %s", wallet.Label, newNetwork)
-	
+
 	return m, nil
 }
 
@@ -720,21 +767,21 @@ func (m ProjectTUIModel) exportWallet() (tea.Model, tea.Cmd) {
 		m.status = "No wallet selected"
 		return m, nil
 	}
-	
+
 	wallet := m.wallets[m.selectedIndex]
 	address := fmt.Sprintf("%x", wallet.Address[:])
-	
+
 	// Export private key
 	privateKey, err := m.currentProject.ExportWallet(address)
 	if err != nil {
 		m.status = fmt.Sprintf("Failed to export wallet: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// For security, we'll just show a confirmation instead of the actual key
-	m.status = fmt.Sprintf("Private key for '%s' exported: %s...%s", 
+	m.status = fmt.Sprintf("Private key for '%s' exported: %s...%s",
 		wallet.Label, privateKey[:6], privateKey[len(privateKey)-4:])
-	
+
 	return m, nil
 }
 
@@ -744,20 +791,20 @@ func (m ProjectTUIModel) confirmDelete() (tea.Model, tea.Cmd) {
 		m.status = "No project selected"
 		return m, nil
 	}
-	
+
 	projectName := m.projects[m.selectedIndex].Name
-	
+
 	// Delete the project
 	if err := m.manager.DeleteProject(projectName); err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to delete project: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Reload project list
 	m.inputMode = ""
 	m.status = fmt.Sprintf("Deleted project '%s'", projectName)
-	return m, m.loadProjects
+	return m, m.loadProjects()
 }
 
 func (m ProjectTUIModel) confirmDeleteWallet() (tea.Model, tea.Cmd) {
@@ -766,24 +813,24 @@ func (m ProjectTUIModel) confirmDeleteWallet() (tea.Model, tea.Cmd) {
 		m.status = "No wallet selected"
 		return m, nil
 	}
-	
+
 	wallet := m.wallets[m.selectedIndex]
 	address := fmt.Sprintf("%x", wallet.Address[:])
-	
+
 	// Delete the wallet
 	if err := m.currentProject.DeleteWallet(address); err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to delete wallet: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Save project
 	if err := m.currentProject.Save(); err != nil {
 		m.inputMode = ""
 		m.status = fmt.Sprintf("Failed to save project: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Reload wallets
 	wallets, err := m.currentProject.GetWallets()
 	if err != nil {
@@ -791,15 +838,15 @@ func (m ProjectTUIModel) confirmDeleteWallet() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to reload wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	m.wallets = wallets
 	if m.selectedIndex >= len(m.wallets) && len(m.wallets) > 0 {
 		m.selectedIndex = len(m.wallets) - 1
 	}
-	
+
 	m.inputMode = ""
 	m.status = fmt.Sprintf("Deleted wallet '%s'", wallet.Label)
-	
+
 	return m, nil
 }
 
@@ -809,7 +856,7 @@ func (m ProjectTUIModel) createBulkWallets() (tea.Model, tea.Cmd) {
 		m.status = "No project selected"
 		return m, nil
 	}
-	
+
 	// Create wallets using bulk configuration
 	createdWallets, err := m.currentProject.BulkCreateWallets(m.bulkConfig)
 	if err != nil {
@@ -817,14 +864,14 @@ func (m ProjectTUIModel) createBulkWallets() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to create bulk wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Save project
 	if err := m.currentProject.Save(); err != nil {
 		m.state = ProjectWalletState
 		m.status = fmt.Sprintf("Failed to save project: %s", err.Error())
 		return m, nil
 	}
-	
+
 	// Reload wallets
 	wallets, err := m.currentProject.GetWallets()
 	if err != nil {
@@ -832,12 +879,12 @@ func (m ProjectTUIModel) createBulkWallets() (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Failed to reload wallets: %s", err.Error())
 		return m, nil
 	}
-	
+
 	m.wallets = wallets
 	m.state = ProjectWalletState
 	m.selectedIndex = 0
 	m.status = fmt.Sprintf("Created %d wallets successfully", len(createdWallets))
-	
+
 	return m, nil
 }
 
@@ -851,22 +898,22 @@ func (m ProjectTUIModel) View() string {
 	case BulkCreateState:
 		return m.renderBulkCreate()
 	}
-	
+
 	return "Unknown state"
 }
 
 // renderProjectList renders the project list view
 func (m ProjectTUIModel) renderProjectList() string {
 	var content strings.Builder
-	
+
 	// Header
 	header := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#89b4fa")).
 		Bold(true).
 		Render("📁 Projects")
-	
+
 	content.WriteString(header + "\n\n")
-	
+
 	// Project list
 	if len(m.projects) == 0 {
 		content.WriteString("No projects found. Press 'n' to create one.\n")
@@ -878,51 +925,46 @@ func (m ProjectTUIModel) renderProjectList() string {
 					Foreground(lipgloss.Color("#cdd6f4")).
 					Bold(true)
 			}
-			
+
 			line := fmt.Sprintf("  %s (%d wallets)", project.Name, project.WalletCount)
 			content.WriteString(style.Render(line) + "\n")
 		}
 	}
-	
+
 	// Status
 	if m.status != "" {
-		content.WriteString("\n" + m.status)
+		statusText := m.status
+		if m.isCreating {
+			statusText += " ⏳"
+		}
+		content.WriteString("\n" + statusText)
 	}
-	
+
 	// Show input fields if in input mode
-	if m.inputMode == "new_project" {
+	switch m.inputMode {
+	case "new_project":
 		content.WriteString("\n\n" + m.input.View())
 		content.WriteString("\n" + lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#6c7086")).
 			Render("⏎•confirm  esc•cancel"))
-	} else if m.inputMode == "new_project_password" {
-		content.WriteString("\n\n" + m.passwordInput.View())
-		content.WriteString("\n" + lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#6c7086")).
-			Render("⏎•confirm  esc•cancel"))
-	} else if m.inputMode == "password" {
-		content.WriteString("\n\n" + m.passwordInput.View())
-		content.WriteString("\n" + lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#6c7086")).
-			Render("⏎•confirm  esc•cancel"))
-	} else if m.inputMode == "confirm_delete" {
+	case "confirm_delete":
 		content.WriteString("\n" + lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#6c7086")).
 			Render("y•yes  n/esc•no"))
-	} else if m.inputMode == "" {
+	case "":
 		help := "\nn•new  ⏎•open  d•delete  q•quit"
 		content.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#6c7086")).
 			Render(help))
 	}
-	
+
 	return content.String()
 }
 
 // renderWalletList renders the wallet list view
 func (m ProjectTUIModel) renderWalletList() string {
 	var content strings.Builder
-	
+
 	// Header with project info
 	if m.currentProject != nil {
 		info := m.currentProject.GetInfo()
@@ -932,14 +974,14 @@ func (m ProjectTUIModel) renderWalletList() string {
 			Bold(true).
 			Render(header) + "\n\n")
 	}
-	
+
 	if len(m.wallets) == 0 {
 		content.WriteString("No wallets in this project. Press 'n' to create one or 'B' for bulk creation.\n")
 	} else {
 		// Wallet list grouped by network
 		mainnetWallets := []ProjectWallet{}
 		testnetWallets := []ProjectWallet{}
-		
+
 		for _, wallet := range m.wallets {
 			if wallet.Network == Mainnet {
 				mainnetWallets = append(mainnetWallets, wallet)
@@ -947,7 +989,7 @@ func (m ProjectTUIModel) renderWalletList() string {
 				testnetWallets = append(testnetWallets, wallet)
 			}
 		}
-		
+
 		// Render mainnet wallets
 		if len(mainnetWallets) > 0 {
 			content.WriteString("🟢 Mainnet:\n")
@@ -960,23 +1002,23 @@ func (m ProjectTUIModel) renderWalletList() string {
 						break
 					}
 				}
-				
+
 				style := lipgloss.NewStyle()
 				if globalIndex == m.selectedIndex {
 					style = style.Background(lipgloss.Color("#313244")).
 						Foreground(lipgloss.Color("#cdd6f4")).
 						Bold(true)
 				}
-				
-				line := fmt.Sprintf("  %s (0x%x...%x)", 
-					wallet.Label, 
-					wallet.Address[:2], 
+
+				line := fmt.Sprintf("  %s (0x%x...%x)",
+					wallet.Label,
+					wallet.Address[:2],
 					wallet.Address[18:])
 				content.WriteString(style.Render(line) + "\n")
 			}
 			content.WriteString("\n")
 		}
-		
+
 		// Render testnet wallets
 		if len(testnetWallets) > 0 {
 			content.WriteString("🟡 Testnet:\n")
@@ -989,51 +1031,73 @@ func (m ProjectTUIModel) renderWalletList() string {
 						break
 					}
 				}
-				
+
 				style := lipgloss.NewStyle()
 				if globalIndex == m.selectedIndex {
 					style = style.Background(lipgloss.Color("#313244")).
 						Foreground(lipgloss.Color("#cdd6f4")).
 						Bold(true)
 				}
-				
-				line := fmt.Sprintf("  %s (0x%x...%x)", 
-					wallet.Label, 
-					wallet.Address[:2], 
+
+				line := fmt.Sprintf("  %s (0x%x...%x)",
+					wallet.Label,
+					wallet.Address[:2],
 					wallet.Address[18:])
 				content.WriteString(style.Render(line) + "\n")
 			}
 		}
 	}
-	
-	// Status and help
+
+	// Status
 	if m.status != "" {
-		content.WriteString("\n" + m.status)
+		statusText := m.status
+		if m.isCreating {
+			statusText += " ⏳"
+		}
+		content.WriteString("\n" + statusText)
 	}
-	
-	help := "\nn•new  B•bulk  e•edit  space•toggle  c•copy  x•export  d•delete  b•back  q•quit"
-	content.WriteString("\n" + lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#6c7086")).
-		Render(help))
-	
+
+	// Show input fields if in input mode
+	switch m.inputMode {
+	case "new_wallet":
+		content.WriteString("\n\n" + m.input.View())
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("⏎•confirm  esc•cancel"))
+	case "edit_wallet":
+		content.WriteString("\n\n" + m.input.View())
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("⏎•confirm  esc•cancel"))
+	case "confirm_delete_wallet":
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render("y•yes  n/esc•no"))
+	case "":
+		help := "\nn•new  B•bulk  e•edit  space•toggle  c•copy  x•export  d•delete  b•back  q•quit"
+		content.WriteString("\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6c7086")).
+			Render(help))
+	}
+
 	return content.String()
 }
 
 // renderBulkCreate renders the bulk creation interface
 func (m ProjectTUIModel) renderBulkCreate() string {
 	var content strings.Builder
-	
+
 	// Header
 	header := "🏗️ Bulk Wallet Creation"
 	content.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#89b4fa")).
 		Bold(true).
 		Render(header) + "\n\n")
-	
+
 	// Configuration
 	content.WriteString(fmt.Sprintf("Count: %d\n", m.bulkConfig.Count))
 	content.WriteString(fmt.Sprintf("Template: %s\n\n", m.bulkConfig.LabelTemplate))
-	
+
 	// Preview
 	content.WriteString("Preview:\n")
 	for i := 0; i < m.bulkConfig.Count; i++ {
@@ -1041,27 +1105,27 @@ func (m ProjectTUIModel) renderBulkCreate() string {
 		if network == "" {
 			network = Testnet
 		}
-		
+
 		style := lipgloss.NewStyle()
 		if i == m.selectedIndex {
 			style = style.Background(lipgloss.Color("#313244"))
 		}
-		
+
 		networkIcon := "🟡"
 		if network == Mainnet {
 			networkIcon = "🟢"
 		}
-		
+
 		label := fmt.Sprintf("wallet-%d", i+1)
 		line := fmt.Sprintf("  %s %s", networkIcon, label)
 		content.WriteString(style.Render(line) + "\n")
 	}
-	
+
 	// Help
 	help := "\nspace•toggle network  ⏎•create  b•back  q•quit"
 	content.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#6c7086")).
 		Render(help))
-	
+
 	return content.String()
 }

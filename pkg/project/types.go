@@ -29,8 +29,8 @@ type Project interface {
 // ProjectManager manages all projects
 type ProjectManager interface {
 	ListProjects() ([]ProjectInfo, error)
-	CreateProject(name string, password []byte) (Project, error)
-	OpenProject(name string, password []byte) (Project, error)
+	CreateProject(name string) (Project, error)
+	OpenProject(name string) (Project, error)
 	DeleteProject(name string) error
 	GetProjectsDir() string
 }
@@ -67,21 +67,24 @@ type EncryptedProjectWallet struct {
 	UpdatedAt    time.Time   `json:"updated_at"`
 }
 
-// ProjectStorage represents the encrypted storage format for a project
+// ProjectStorage represents the storage format for a project
 type ProjectStorage struct {
 	Version       string `json:"version"`
 	Algorithm     string `json:"algorithm"`
 	ProjectInfo   ProjectInfo `json:"project_info"`
 	
-	// ML-KEM encryption fields
-	KDF                  KDFParams `json:"kdf"`
-	MLKEMPublicKey       string    `json:"mlkem_public_key"`
-	MLKEMPrivateKeyEnc   string    `json:"mlkem_private_key_enc"`
-	MLKEMPrivateKeyNonce string    `json:"mlkem_private_key_nonce"`
+	// Legacy ML-KEM encryption fields (for backward compatibility)
+	KDF                  KDFParams `json:"kdf,omitempty"`
+	MLKEMPublicKey       string    `json:"mlkem_public_key,omitempty"`
+	MLKEMPrivateKeyEnc   string    `json:"mlkem_private_key_enc,omitempty"`
+	MLKEMPrivateKeyNonce string    `json:"mlkem_private_key_nonce,omitempty"`
 	
-	// Encrypted wallet data
-	EncryptedWallets string `json:"encrypted_wallets"`
-	HMAC            string `json:"hmac"`
+	// Legacy encrypted wallet data (for backward compatibility)
+	EncryptedWallets string `json:"encrypted_wallets,omitempty"`
+	HMAC            string `json:"hmac,omitempty"`
+	
+	// New lightweight wallet storage (per-wallet encryption)
+	WalletsJSON string `json:"wallets_json,omitempty"`
 	
 	UpdatedAt time.Time `json:"updated_at"`
 }

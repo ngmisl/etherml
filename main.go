@@ -1810,7 +1810,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Switch to project mode
 			m.projectMode = true
 			if m.projectModel == nil {
-				m.projectModel = project.NewProjectTUIModel(m.projectMgr)
+				m.projectModel = project.NewProjectTUIModel(m.projectMgr, m.walletMgr.masterPassword)
 				// Initialize with current window size
 				if m.width > 0 && m.height > 0 {
 					m.projectModel, _ = m.projectModel.Update(tea.WindowSizeMsg{
