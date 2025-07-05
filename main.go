@@ -1356,7 +1356,7 @@ func filterWallets(wallets []Wallet, query string) []Wallet {
 // Loading complete message
 type loadingCompleteMsg struct{}
 
-func initialModel(walletMgr *WalletManager) model {
+func initialModel(walletMgr *WalletManager) *model {
 	wallets, err := walletMgr.ListWallets()
 	if err != nil {
 		wallets = []Wallet{} // Empty list on error
@@ -1418,7 +1418,7 @@ func initialModel(walletMgr *WalletManager) model {
 	projectsDir := filepath.Join(homeDir, ".qwallet", "projects")
 	projectMgr := project.NewManager(projectsDir)
 
-	return model{
+return &model{
 		list:            l,
 		walletMgr:       walletMgr,
 		wallets:         wallets,
@@ -1437,7 +1437,7 @@ func initialModel(walletMgr *WalletManager) model {
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
 		textinput.Blink,
@@ -1469,7 +1469,7 @@ func (m *model) refreshWalletList() {
 	}
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -1810,7 +1810,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Switch to project mode
 			m.projectMode = true
 			if m.projectModel == nil {
-				m.projectModel = project.NewProjectTUIModel(m.projectMgr, m.walletMgr.masterPassword)
+				// Create wallet manager adapter
+			walletAdapter := &WalletManagerAdapter{walletMgr: m.walletMgr}
+			m.projectModel = project.NewProjectTUIModel(m.projectMgr, walletAdapter)
 				// Initialize with current window size
 				if m.width > 0 && m.height > 0 {
 					m.projectModel, _ = m.projectModel.Update(tea.WindowSizeMsg{
@@ -1912,7 +1914,7 @@ func (m model) renderWalletGrid() string {
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	if m.quitting {
 		farewell := lipgloss.NewStyle().
 			Foreground(lipgloss.Color(successColor)).
@@ -2190,6 +2192,44 @@ func SecureZero(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// WalletManagerAdapter adapts WalletManager for project system
+type WalletManagerAdapter struct {
+	walletMgr *WalletManager
+}
+
+func (w *WalletManagerAdapter) ListWallets() ([]project.WalletInfo, error) {
+	wallets, err := w.walletMgr.ListWallets()
+	if err != nil {
+		return nil, err
+	}
+
+	var result []project.WalletInfo
+	for _, wallet := range wallets {
+		result = append(result, project.WalletInfo{
+			Address:   wallet.Address,
+			Label:     wallet.Label,
+			CreatedAt: wallet.CreatedAt.Format("2006-01-02 15:04"),
+		})
+	}
+	return result, nil
+}
+
+func (w *WalletManagerAdapter) AddWalletWithLabel(label string) (string, error) {
+	result := GenerateWallet()
+	wallet, err := result.Unwrap()
+	if err != nil {
+		return "", err
+	}
+
+	wallet.Label = label
+	if err := w.walletMgr.AddWallet(wallet); err != nil {
+		return "", err
+	}
+
+	// Return address as hex string without 0x prefix
+	return hex.EncodeToString(wallet.Address[:]), nil
 }
 
 // GenerateSecureRandom generates cryptographically secure random bytes

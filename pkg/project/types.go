@@ -12,18 +12,14 @@ const (
 	Testnet NetworkType = "testnet"
 )
 
-// Project represents a project folder containing organized wallets
+// Project represents a project folder containing organized wallet references
 type Project interface {
 	GetInfo() ProjectInfo
-	GetWallets() ([]ProjectWallet, error)
-	CreateWallet(label string, network NetworkType) (*ProjectWallet, error)
-	BulkCreateWallets(config BulkConfig) ([]*ProjectWallet, error)
-	EditWallet(address string, newLabel string, newNetwork NetworkType) error
-	DeleteWallet(address string) error
-	ExportWallet(address string) (string, error) // Returns private key hex
+	GetWalletRefs() ([]WalletRef, error)
+	AddWalletRef(address string, label string, network NetworkType) error
+	EditWalletRef(address string, newLabel string, newNetwork NetworkType) error
+	DeleteWalletRef(address string) error
 	Save() error
-	Lock()
-	IsLocked() bool
 }
 
 // ProjectManager manages all projects
@@ -37,74 +33,38 @@ type ProjectManager interface {
 
 // ProjectInfo contains project metadata
 type ProjectInfo struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	WalletCount int       `json:"wallet_count"`
-	MainnetCount int      `json:"mainnet_count"`
-	TestnetCount int      `json:"testnet_count"`
+	Name         string    `json:"name"`
+	Description  string    `json:"description"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	WalletCount  int       `json:"wallet_count"`
+	MainnetCount int       `json:"mainnet_count"`
+	TestnetCount int       `json:"testnet_count"`
 }
 
-// ProjectWallet represents a wallet within a project
-type ProjectWallet struct {
-	Address     [20]byte    `json:"address"`
-	PrivateKey  [32]byte    `json:"-"` // Never serialized
-	Label       string      `json:"label"`
-	Network     NetworkType `json:"network"`
-	CreatedAt   time.Time   `json:"created_at"`
-	UpdatedAt   time.Time   `json:"updated_at"`
+// WalletRef represents a reference to a wallet stored in the main wallet manager
+type WalletRef struct {
+	Address   string      `json:"address"`    // Hex address (without 0x prefix)
+	Label     string      `json:"label"`      // Project-specific label
+	Network   NetworkType `json:"network"`    // Network assignment
+	CreatedAt time.Time   `json:"created_at"` // When added to project
+	UpdatedAt time.Time   `json:"updated_at"` // Last updated in project
 }
 
-// EncryptedProjectWallet for storage
-type EncryptedProjectWallet struct {
-	Address      string      `json:"address"`
-	EncryptedKey string      `json:"encrypted_key"`
-	Nonce        string      `json:"nonce"`
-	Label        string      `json:"label"`
-	Network      NetworkType `json:"network"`
-	CreatedAt    time.Time   `json:"created_at"`
-	UpdatedAt    time.Time   `json:"updated_at"`
-}
-
-// ProjectStorage represents the storage format for a project
+// ProjectStorage represents the simple storage format for a project
 type ProjectStorage struct {
-	Version       string `json:"version"`
-	Algorithm     string `json:"algorithm"`
-	ProjectInfo   ProjectInfo `json:"project_info"`
-	
-	// Legacy ML-KEM encryption fields (for backward compatibility)
-	KDF                  KDFParams `json:"kdf,omitempty"`
-	MLKEMPublicKey       string    `json:"mlkem_public_key,omitempty"`
-	MLKEMPrivateKeyEnc   string    `json:"mlkem_private_key_enc,omitempty"`
-	MLKEMPrivateKeyNonce string    `json:"mlkem_private_key_nonce,omitempty"`
-	
-	// Legacy encrypted wallet data (for backward compatibility)
-	EncryptedWallets string `json:"encrypted_wallets,omitempty"`
-	HMAC            string `json:"hmac,omitempty"`
-	
-	// New lightweight wallet storage (per-wallet encryption)
-	WalletsJSON string `json:"wallets_json,omitempty"`
-	
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// KDFParams for Argon2id
-type KDFParams struct {
-	Function    string `json:"function"`
-	Memory      uint32 `json:"memory"`
-	Iterations  uint32 `json:"iterations"`
-	Parallelism uint8  `json:"parallelism"`
-	Salt        string `json:"salt"`
-	KeyLen      uint32 `json:"key_len"`
+	Version     string      `json:"version"`
+	ProjectInfo ProjectInfo `json:"project_info"`
+	WalletRefs  []WalletRef `json:"wallet_refs"`
+	UpdatedAt   time.Time   `json:"updated_at"`
 }
 
 // BulkConfig for bulk wallet creation
 type BulkConfig struct {
-	Count         int                     `json:"count"`
-	LabelTemplate string                  `json:"label_template"`
-	NetworkConfig map[int]NetworkType     `json:"network_config"` // index -> network
-	AutoLabel     bool                    `json:"auto_label"`
+	Count         int                 `json:"count"`
+	LabelTemplate string              `json:"label_template"`
+	NetworkConfig map[int]NetworkType `json:"network_config"` // index -> network
+	AutoLabel     bool                `json:"auto_label"`
 }
 
 // ProjectTUIState represents the current state of the project TUI

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // Manager implements ProjectManager interface
@@ -45,9 +44,9 @@ func (m *Manager) ListProjects() ([]ProjectInfo, error) {
 		}
 
 		projectPath := filepath.Join(m.projectsDir, entry.Name())
-		projectFile := filepath.Join(projectPath, "project.enc")
+		projectFile := filepath.Join(projectPath, "project.json")
 
-		// Check if project.enc exists
+		// Check if project.json exists
 		if _, err := os.Stat(projectFile); os.IsNotExist(err) {
 			continue
 		}
@@ -65,7 +64,7 @@ func (m *Manager) ListProjects() ([]ProjectInfo, error) {
 	return projects, nil
 }
 
-// readProjectInfo reads basic project info without full decryption
+// readProjectInfo reads basic project info from JSON file
 func (m *Manager) readProjectInfo(projectFile string) (ProjectInfo, error) {
 	data, err := os.ReadFile(projectFile)
 	if err != nil {
@@ -80,7 +79,7 @@ func (m *Manager) readProjectInfo(projectFile string) (ProjectInfo, error) {
 	return storage.ProjectInfo, nil
 }
 
-// CreateProject creates a new project with the given name and password
+// CreateProject creates a new project with the given name
 func (m *Manager) CreateProject(name string) (Project, error) {
 	// Validate name
 	if strings.TrimSpace(name) == "" {
@@ -101,19 +100,10 @@ func (m *Manager) CreateProject(name string) (Project, error) {
 		return nil, fmt.Errorf("failed to create project directory: %w", err)
 	}
 
-	// Create new project instance
-	proj := &ProjectImpl{
-		info: ProjectInfo{
-			Name:        name,
-			Description: fmt.Sprintf("Project: %s", name),
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
-		},
-		projectPath: projectPath,
-		isLocked:    true, // Start locked
-	}
+	// Create new project instance with simple setup (no crypto)
+	proj := NewProject(name, projectPath)
 
-	// Initialize the project with a lightweight setup
+	// Initialize the project with simple JSON storage
 	if err := proj.Initialize(); err != nil {
 		// Clean up on failure
 		os.RemoveAll(projectPath)
@@ -123,11 +113,11 @@ func (m *Manager) CreateProject(name string) (Project, error) {
 	return proj, nil
 }
 
-// OpenProject opens an existing project with the given password
+// OpenProject opens an existing project
 func (m *Manager) OpenProject(name string) (Project, error) {
 	safeName := sanitizeProjectName(name)
 	projectPath := filepath.Join(m.projectsDir, safeName)
-	projectFile := filepath.Join(projectPath, "project.enc")
+	projectFile := filepath.Join(projectPath, "project.json")
 
 	// Check if project exists
 	if _, err := os.Stat(projectFile); os.IsNotExist(err) {
@@ -135,10 +125,7 @@ func (m *Manager) OpenProject(name string) (Project, error) {
 	}
 
 	// Create project instance and load
-	proj := &ProjectImpl{
-		projectPath: projectPath,
-		isLocked:    true,
-	}
+	proj := NewProject(name, projectPath)
 
 	if err := proj.Load(); err != nil {
 		return nil, fmt.Errorf("failed to open project: %w", err)
