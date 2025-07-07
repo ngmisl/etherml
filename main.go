@@ -28,16 +28,18 @@ import (
 	"golang.design/x/clipboard"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/term"
+
+	"wallet/pkg/quantum"
 )
 
 // Type definitions for type safety
 type (
-	PrivateKey    [32]byte
-	PublicKey     []byte
-	Address       [20]byte
-	Salt          [32]byte
-	Nonce         [12]byte
-	EncryptedData []byte
+	PrivateKey    = quantum.PrivateKey
+	PublicKey     = quantum.PublicKey
+	Address       = quantum.Address
+	Salt          = quantum.Salt
+	Nonce         = quantum.Nonce
+	EncryptedData = quantum.EncryptedData
 )
 
 // Wallet represents an Ethereum wallet
@@ -180,7 +182,7 @@ func GenerateWallet() Result[*Wallet] {
 
 	// Zero the original key
 	b := crypto.FromECDSA(privateKey)
-	SecureZero(b)
+	quantum.SecureZero(b)
 
 	return Ok(wallet)
 }
@@ -190,117 +192,8 @@ func deriveKey(password []byte, salt Salt, params KDFParams) []byte {
 	return argon2.IDKey(password, salt[:], params.Iterations, params.Memory, params.Parallelism, params.KeyLen)
 }
 
-// Generate ML-KEM-1024 keypair
-func generateMLKEMKeyPair() ([]byte, []byte, error) {
-	decapsKey, err := mlkem.GenerateKey1024()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate ML-KEM-1024 keypair: %w", err)
-	}
-	encapsKey := decapsKey.EncapsulationKey()
-
-	// ML-KEM keys in Go are already byte arrays
-	encapsKeyBytes := encapsKey.Bytes()
-	decapsKeyBytes := decapsKey.Bytes()
-
-	// Basic validation - ML-KEM-1024 sizes
-	// Encapsulation key should be 1568 bytes
-	// Decapsulation key should be 3168 bytes
-	if len(encapsKeyBytes) == 0 || len(decapsKeyBytes) == 0 {
-		return nil, nil, fmt.Errorf("invalid key sizes generated")
-	}
-
-	return encapsKeyBytes, decapsKeyBytes, nil
-}
-
-// Encrypt data using ML-KEM-1024 + AES-256-GCM hybrid approach
-func encryptDataPQC(plaintext []byte, encapsKeyBytes []byte) (EncryptedData, string, error) {
-	// Create the encapsulation key
-	encapsKey, err := mlkem.NewEncapsulationKey1024(encapsKeyBytes)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to create encapsulation key: %w", err)
-	}
-
-	// Generate shared secret using ML-KEM-1024
-	sharedSecret, ciphertext := encapsKey.Encapsulate()
-
-	// Use shared secret as AES key (first 32 bytes for AES-256)
-	aesKey := make([]byte, 32)
-	copy(aesKey, sharedSecret[:32])
-
-	// Zero the shared secret immediately after copying
-	SecureZero(sharedSecret[:])
-
-	encrypted, nonce, err := encryptData(plaintext, aesKey)
-	if err != nil {
-		SecureZero(aesKey) // Zero AES key on error
-		return nil, "", err
-	}
-
-	// Combine ML-KEM ciphertext with AES ciphertext
-	combined := append(ciphertext, encrypted...)
-	nonceB64 := base64.StdEncoding.EncodeToString(nonce[:])
-
-	// Zero the AES key
-	SecureZero(aesKey)
-
-	return EncryptedData(combined), nonceB64, nil
-}
-
-// Decrypt data using ML-KEM-1024 + AES-256-GCM hybrid approach
-func decryptDataPQC(combined EncryptedData, decapsKeyBytes []byte, nonceB64 string) ([]byte, error) {
-	// Create the decapsulation key
-	decapsKey, err := mlkem.NewDecapsulationKey1024(decapsKeyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create decapsulation key: %w", err)
-	}
-
-	// ML-KEM-1024 ciphertext is 1568 bytes
-	const mlkemCiphertextSize = 1568
-	if len(combined) < mlkemCiphertextSize {
-		return nil, fmt.Errorf("invalid ciphertext: too short (got %d bytes, need at least %d)",
-			len(combined), mlkemCiphertextSize)
-	}
-
-	mlkemCiphertext := combined[:mlkemCiphertextSize]
-	aesCiphertext := combined[mlkemCiphertextSize:]
-
-	// Decapsulate to get shared secret
-	sharedSecret, err := decapsKey.Decapsulate(mlkemCiphertext)
-	if err != nil {
-		return nil, fmt.Errorf("ML-KEM decapsulation failed: %w", err)
-	}
-
-	// Copy AES key to ensure we can zero both independently
-	aesKey := make([]byte, 32)
-	copy(aesKey, sharedSecret[:32])
-
-	// Zero shared secret immediately
-	SecureZero(sharedSecret[:])
-
-	// Decrypt with AES
-	nonceBytes, err := base64.StdEncoding.DecodeString(nonceB64)
-	if err != nil {
-		SecureZero(aesKey)
-		return nil, fmt.Errorf("failed to decode nonce: %w", err)
-	}
-
-	var nonce Nonce
-	copy(nonce[:], nonceBytes)
-
-	plaintext, err := decryptData(EncryptedData(aesCiphertext), aesKey, nonce)
-
-	// Always zero the AES key
-	SecureZero(aesKey)
-
-	if err != nil {
-		return nil, fmt.Errorf("AES decryption failed: %w", err)
-	}
-
-	return plaintext, nil
-}
-
-// Encrypt data using AES-256-GCM
-func encryptData(plaintext []byte, key []byte) (EncryptedData, Nonce, error) {
+// Helper functions for ML-KEM private key storage encryption (not the hybrid quantum encryption)
+func encryptDataForMLKEMKey(plaintext []byte, key []byte) (EncryptedData, Nonce, error) {
 	if len(key) != 32 {
 		return nil, Nonce{}, fmt.Errorf("invalid key length: got %d, expected 32", len(key))
 	}
@@ -324,8 +217,7 @@ func encryptData(plaintext []byte, key []byte) (EncryptedData, Nonce, error) {
 	return EncryptedData(ciphertext), nonce, nil
 }
 
-// Decrypt data using AES-256-GCM
-func decryptData(ciphertext EncryptedData, key []byte, nonce Nonce) ([]byte, error) {
+func decryptDataForMLKEMKey(ciphertext EncryptedData, key []byte, nonce Nonce) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("invalid key length: got %d, expected 32", len(key))
 	}
@@ -347,6 +239,11 @@ func decryptData(ciphertext EncryptedData, key []byte, nonce Nonce) ([]byte, err
 
 	return plaintext, nil
 }
+
+
+
+
+
 
 // NewWalletManager creates a new wallet manager
 func NewWalletManager(filePath string) *WalletManager {
@@ -388,13 +285,13 @@ func (wm *WalletManager) Initialize(password []byte) error {
 		wm.key = deriveKey(password, salt, wm.storage.KDF)
 
 		// Generate ML-KEM-1024 keypair
-		encapsKeyBytes, decapsKeyBytes, err := generateMLKEMKeyPair()
+		encapsKeyBytes, decapsKeyBytes, err := quantum.GenerateMLKEMKeyPair()
 		if err != nil {
 			return fmt.Errorf("failed to generate ML-KEM keypair: %w", err)
 		}
 
 		// Encrypt the ML-KEM private key with AES using derived key
-		encryptedPrivKey, privKeyNonce, err := encryptData(decapsKeyBytes, wm.key)
+		encryptedPrivKey, privKeyNonce, err := encryptDataForMLKEMKey(decapsKeyBytes, wm.key)
 		if err != nil {
 			return fmt.Errorf("failed to encrypt ML-KEM private key: %w", err)
 		}
@@ -462,7 +359,7 @@ func (wm *WalletManager) Load(password []byte) error {
 	copy(privKeyNonce[:], privKeyNonceBytes)
 
 	// Decrypt the ML-KEM private key using regular AES decryption (not hybrid ML-KEM)
-	decryptedPrivKey, err := decryptData(EncryptedData(encryptedPrivKey), wm.key, privKeyNonce)
+	decryptedPrivKey, err := decryptDataForMLKEMKey(EncryptedData(encryptedPrivKey), wm.key, privKeyNonce)
 	if err != nil {
 		return fmt.Errorf("invalid password - failed to decrypt ML-KEM private key: %w", err)
 	}
@@ -484,7 +381,7 @@ func (wm *WalletManager) Load(password []byte) error {
 	derivedEncapsKeyBytes := derivedEncapsKey.Bytes()
 
 	// Verify the derived public key matches the stored one
-	if !SecureCompare(encapsKeyBytes, derivedEncapsKeyBytes) {
+	if !quantum.SecureCompare(encapsKeyBytes, derivedEncapsKeyBytes) {
 		return errors.New("invalid password - ML-KEM key mismatch")
 	}
 
@@ -541,7 +438,7 @@ func (wm *WalletManager) AddWallet(wallet *Wallet) error {
 	}
 
 	// Use post-quantum encryption
-	encrypted, nonce, err := encryptDataPQC(wallet.PrivateKey[:], encapsKeyBytes)
+	encrypted, nonce, err := quantum.EncryptDataPQC(wallet.PrivateKey[:], encapsKeyBytes)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt key with ML-KEM: %w", err)
 	}
@@ -603,7 +500,7 @@ func (wm *WalletManager) decryptWallet(ew *EncryptedWallet) (*Wallet, error) {
 	}
 
 	// Use post-quantum decryption
-	decrypted, err := decryptDataPQC(EncryptedData(encrypted), wm.mlkemPrivateKey, ew.Nonce)
+	decrypted, err := quantum.DecryptDataPQC(EncryptedData(encrypted), wm.mlkemPrivateKey, ew.Nonce)
 	if err != nil {
 		return nil, fmt.Errorf("ML-KEM decryption failed: %w", err)
 	}
@@ -621,7 +518,7 @@ func (wm *WalletManager) decryptWallet(ew *EncryptedWallet) (*Wallet, error) {
 	copy(wallet.Address[:], addressBytes)
 
 	// Zero the decrypted key data
-	SecureZero(decrypted)
+	quantum.SecureZero(decrypted)
 
 	return wallet, nil
 }
@@ -1110,7 +1007,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Clear private key display on any other key
 				m.showingPrivateKey = false
 				if m.selectedWallet != nil {
-					SecureZero(m.selectedWallet.PrivateKey[:])
+					quantum.SecureZero(m.selectedWallet.PrivateKey[:])
 					m.selectedWallet = nil
 				}
 				m.status = infoStyle.Render("🔒 Private key cleared from memory")
@@ -1168,7 +1065,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								addr := hex.EncodeToString(wallet.Address[:])
 								m.status = successStyle.Render(fmt.Sprintf("✅ Wallet created! %s", formatAddress(addr)))
 								// Zero the private key in memory
-								SecureZero(wallet.PrivateKey[:])
+								quantum.SecureZero(wallet.PrivateKey[:])
 							} else {
 								m.status = errorStyle.Render("❌ Failed to save wallet: " + err.Error())
 							}
@@ -1194,7 +1091,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Verify password and show private key
 					if m.selectedWallet != nil {
 						password := m.passwordInput.Value()
-						if SecureCompare([]byte(password), m.walletMgr.masterPassword) {
+						if quantum.SecureCompare([]byte(password), m.walletMgr.masterPassword) {
 							m.showingPrivateKey = true
 							m.status = warningStyle.Render("🔓 Private key displayed - Press any key to clear")
 						} else {
@@ -1692,7 +1589,7 @@ func main() {
 	}
 	defer func() {
 		// Zero password
-		SecureZero(password)
+		quantum.SecureZero(password)
 	}()
 
 	// Initialize wallet manager
@@ -1715,28 +1612,5 @@ func main() {
 
 // Additional security functions that would be in separate files in production
 
-// SecureCompare performs constant-time comparison
-func SecureCompare(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var result byte
-	for i := 0; i < len(a); i++ {
-		result |= a[i] ^ b[i]
-	}
-	return result == 0
-}
 
-// SecureZero zeros memory
-func SecureZero(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
 
-// GenerateSecureRandom generates cryptographically secure random bytes
-func GenerateSecureRandom(size int) ([]byte, error) {
-	b := make([]byte, size)
-	_, err := rand.Read(b)
-	return b, err
-}
