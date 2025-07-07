@@ -10,6 +10,16 @@ type (
 	EncryptedData []byte
 )
 
+// KDFParams for Argon2id configuration
+type KDFParams struct {
+	Function    string `json:"function"`
+	Memory      uint32 `json:"memory"`
+	Iterations  uint32 `json:"iterations"`
+	Parallelism uint8  `json:"parallelism"`
+	Salt        string `json:"salt"`
+	KeyLen      uint32 `json:"key_len"`
+}
+
 // ML-KEM-1024 Constants
 const (
 	// ML-KEM-1024 ciphertext is 1568 bytes
