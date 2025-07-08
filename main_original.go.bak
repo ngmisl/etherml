@@ -17,11 +17,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/ethereum/go-ethereum/crypto"
+	"golang.design/x/clipboard"
 	"golang.org/x/term"
 
 	"wallet/pkg/quantum"
-	"wallet/pkg/tui"
 )
 
 // Type definitions for type safety
@@ -73,6 +80,7 @@ type StorageFile struct {
 	DecoyMLKEMPrivateKeyNonce string       `json:"decoy_mlkem_private_key_nonce,omitempty"`
 	DecoyWallets         []EncryptedWallet `json:"decoy_wallets,omitempty"`
 }
+
 
 // WalletManager handles wallet operations with deniable encryption support
 type WalletManager struct {
@@ -235,6 +243,11 @@ func decryptDataForMLKEMKey(ciphertext EncryptedData, key []byte, nonce Nonce) (
 
 	return plaintext, nil
 }
+
+
+
+
+
 
 // generateDecoyWallets creates realistic fake wallets for plausible deniability
 func generateDecoyWallets(decoyPassword []byte, count int) ([]Wallet, error) {
@@ -842,32 +855,6 @@ func (wm *WalletManager) ListWallets() ([]Wallet, error) {
 	return wallets, nil
 }
 
-// UpdateWalletLabel updates the label of a wallet by address (supports both real and decoy modes)
-func (wm *WalletManager) UpdateWalletLabel(address string, newLabel string) error {
-	// Remove 0x prefix if present
-	address = strings.TrimPrefix(address, "0x")
-	
-	if wm.isDecoyMode {
-		// Update decoy wallet label
-		for i, ew := range wm.storage.DecoyWallets {
-			if strings.EqualFold(ew.Address, address) {
-				wm.storage.DecoyWallets[i].Label = newLabel
-				return wm.Save()
-			}
-		}
-		return fmt.Errorf("decoy wallet with address %s not found", address)
-	}
-
-	// Update real wallet label
-	for i, ew := range wm.storage.Wallets {
-		if strings.EqualFold(ew.Address, address) {
-			wm.storage.Wallets[i].Label = newLabel
-			return wm.Save()
-		}
-	}
-	return fmt.Errorf("wallet with address %s not found", address)
-}
-
 // Delete wallet from storage (supports both real and decoy modes)
 func (wm *WalletManager) DeleteWallet(address string) error {
 	if wm.isDecoyMode {
@@ -973,66 +960,1036 @@ func (wm *WalletManager) decryptDecoyWallet(ew *EncryptedWallet) (*Wallet, error
 	return wallet, nil
 }
 
-// TUI Wallet interface implementation
-func (wm *WalletManager) ListTUIWallets() ([]tui.Wallet, error) {
-	mainWallets, err := wm.ListWallets()
+// Enhanced TUI Components
+
+type model struct {
+	list              list.Model
+	walletMgr         *WalletManager
+	wallets           []Wallet
+	filteredWallets   []Wallet
+	err               error
+	quitting          bool
+	input             textinput.Model
+	passwordInput     textinput.Model
+	inputMode         string
+	searchQuery       string
+	help              help.Model
+	keys              keyMap
+	status            string
+	statusColor       lipgloss.Color
+	showingPrivateKey bool
+	selectedWallet    *Wallet
+	confirmingDelete  bool
+	walletToDelete    *Wallet
+	width             int
+	height            int
+	spinner           spinner.Model
+	loading           bool
+	loadingMsg        string
+	selectedIndex     int // Track selection for grid layout
+	editingWallet     *Wallet // Wallet currently being edited
+}
+
+type keyMap struct {
+	Up       key.Binding
+	Down     key.Binding
+	New      key.Binding
+	Delete   key.Binding
+	Export   key.Binding
+	Copy     key.Binding
+	Search   key.Binding
+	Quit     key.Binding
+	Help     key.Binding
+	Enter    key.Binding
+	Escape   key.Binding
+	Tab      key.Binding
+	ShiftTab key.Binding
+}
+
+var keys = keyMap{
+	Up: key.NewBinding(
+		key.WithKeys("up", "k"),
+		key.WithHelp("↑/k", "up"),
+	),
+	Down: key.NewBinding(
+		key.WithKeys("down", "j"),
+		key.WithHelp("↓/j", "down"),
+	),
+	New: key.NewBinding(
+		key.WithKeys("n"),
+		key.WithHelp("n", "new wallet"),
+	),
+	Delete: key.NewBinding(
+		key.WithKeys("d"),
+		key.WithHelp("d", "delete"),
+	),
+	Export: key.NewBinding(
+		key.WithKeys("e"),
+		key.WithHelp("e", "export key"),
+	),
+	Copy: key.NewBinding(
+		key.WithKeys("c"),
+		key.WithHelp("c", "copy address"),
+	),
+	Search: key.NewBinding(
+		key.WithKeys("/"),
+		key.WithHelp("/", "search"),
+	),
+	Quit: key.NewBinding(
+		key.WithKeys("q", "ctrl+c"),
+		key.WithHelp("q", "quit"),
+	),
+	Help: key.NewBinding(
+		key.WithKeys("?"),
+		key.WithHelp("?", "help"),
+	),
+	Enter: key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("⏎", "confirm"),
+	),
+	Escape: key.NewBinding(
+		key.WithKeys("esc"),
+		key.WithHelp("esc", "cancel"),
+	),
+	Tab: key.NewBinding(
+		key.WithKeys("tab"),
+		key.WithHelp("tab", "next"),
+	),
+	ShiftTab: key.NewBinding(
+		key.WithKeys("shift+tab"),
+		key.WithHelp("⇧tab", "prev"),
+	),
+}
+
+type item struct {
+	wallet Wallet
+}
+
+// Catppuccin Mocha Color Palette
+const (
+	// Primary colors
+	primaryColor   = "#89b4fa" // Blue
+	secondaryColor = "#a6e3a1" // Green
+	accentColor    = "#fab387" // Peach
+	mauveColor     = "#cba6f7" // Mauve
+	
+	// Semantic colors
+	successColor = "#a6e3a1" // Green
+	warningColor = "#f9e2af" // Yellow
+	errorColor   = "#f38ba8" // Red
+	infoColor    = "#94e2d5" // Teal
+	
+	// Text colors
+	textColor     = "#cdd6f4" // Text
+	subtext1Color = "#bac2de" // Subtext1
+	subtext0Color = "#a6adc8" // Subtext0
+	
+	// Surface colors
+	bgColor      = "#1e1e2e" // Base
+	mantleColor  = "#181825" // Mantle
+	crustColor   = "#11111b" // Crust
+	cardBgColor  = "#313244" // Surface0
+	surface1Color = "#45475a" // Surface1
+	surface2Color = "#585b70" // Surface2
+	
+	// Overlay colors
+	mutedColor    = "#6c7086" // Overlay0
+	overlay1Color = "#7f849c" // Overlay1
+	overlay2Color = "#9399b2" // Overlay2
+	borderColor   = "#45475a" // Surface1
+	
+	// Special colors
+	highlightColor = "#b4befe" // Lavender
+	rosewaterColor = "#f5e0dc" // Rosewater
+	pinkColor      = "#f5c2e7" // Pink
+)
+
+// Enhanced Styles
+var (
+	// Base styles
+	baseStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(textColor))
+
+	// Message styles
+	successStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(successColor)).
+			Bold(true)
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(errorColor)).
+			Bold(true)
+
+	warningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(warningColor)).
+			Bold(true)
+
+	infoStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(infoColor)).
+			Bold(true)
+
+	mutedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(subtext0Color))
+
+	// Enhanced layout styles
+	headerStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(textColor)).
+			Background(lipgloss.Color(mantleColor)).
+			Bold(true).
+			Padding(1, 2).
+			MarginBottom(1).
+			Align(lipgloss.Center)
+
+	cardStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(textColor)).
+			Background(lipgloss.Color(cardBgColor)).
+			Padding(0, 1).
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(lipgloss.Color(borderColor))
+
+	selectedCardStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(crustColor)).
+				Background(lipgloss.Color(primaryColor)).
+				Bold(true).
+				Padding(0, 1).
+				Border(lipgloss.NormalBorder(), false, false, false, true).
+				BorderForeground(lipgloss.Color(primaryColor))
+
+	modalStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(mauveColor)).
+			Background(lipgloss.Color(surface2Color)).
+			Padding(2, 4).
+			AlignHorizontal(lipgloss.Center).
+			AlignVertical(lipgloss.Center)
+
+	statusBarStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color(cardBgColor)).
+			Foreground(lipgloss.Color(textColor)).
+			Padding(0, 1).
+			MarginTop(1)
+
+	helpBarStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(subtext1Color)).
+			Background(lipgloss.Color(mantleColor)).
+			Padding(0, 1)
+
+	titleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(primaryColor)).
+			Bold(true).
+			MarginBottom(1).
+			Align(lipgloss.Center)
+
+	addressStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(accentColor)).
+			Bold(true)
+
+	labelStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(secondaryColor)).
+			Italic(true)
+
+	iconStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(primaryColor))
+
+	quantumBadgeStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(crustColor)).
+				Background(lipgloss.Color(mauveColor)).
+				Padding(0, 1).
+				Bold(true)
+
+	boxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(borderColor)).
+			Padding(1, 2)
+)
+
+func (i item) FilterValue() string {
+	addr := hex.EncodeToString(i.wallet.Address[:])
+	return i.wallet.Label + " 0x" + addr
+}
+
+func (i item) Title() string {
+	addr := hex.EncodeToString(i.wallet.Address[:])
+	addressStr := formatAddress(addr)
+
+	if i.wallet.Label != "" {
+		// Don't apply inline styling - let the delegate handle selection styling
+		return fmt.Sprintf("🔐 %s (%s)", i.wallet.Label, addressStr)
+	}
+	return fmt.Sprintf("🔐 %s", addressStr)
+}
+
+func (i item) Description() string {
+	timeAgo := humanizeTime(i.wallet.CreatedAt)
+	return fmt.Sprintf("📅 Created %s", timeAgo)
+}
+
+// Format address for display
+func formatAddress(addr string) string {
+	if len(addr) >= 16 {
+		return "0x" + addr[:6] + "..." + addr[len(addr)-4:]
+	}
+	return "0x" + addr
+}
+
+// Humanize time display
+func humanizeTime(t time.Time) string {
+	diff := time.Since(t)
+	switch {
+	case diff < time.Minute:
+		return "just now"
+	case diff < time.Hour:
+		return fmt.Sprintf("%d min ago", int(diff.Minutes()))
+	case diff < 24*time.Hour:
+		return fmt.Sprintf("%d hours ago", int(diff.Hours()))
+	case diff < 7*24*time.Hour:
+		return fmt.Sprintf("%d days ago", int(diff.Hours()/24))
+	default:
+		return t.Format("Jan 2, 2006")
+	}
+}
+
+// Initialize clipboard
+func initClipboard() error {
+	err := clipboard.Init()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to initialize clipboard: %w", err)
+	}
+	return nil
+}
+
+// Copy to clipboard with timeout
+func copyToClipboard(text string, timeout time.Duration) error {
+	clipboard.Write(clipboard.FmtText, []byte(text))
+
+	// Clear clipboard after timeout for sensitive data
+	if timeout > 0 {
+		go func() {
+			time.Sleep(timeout)
+			clipboard.Write(clipboard.FmtText, []byte(""))
+		}()
 	}
 
-	tuiWallets := make([]tui.Wallet, len(mainWallets))
-	for i, mw := range mainWallets {
-		tuiWallets[i] = tui.Wallet{
-			PrivateKey: mw.PrivateKey,
-			Address:    mw.Address,
-			CreatedAt:  mw.CreatedAt,
-			Label:      mw.Label,
+	return nil
+}
+
+// Filter wallets based on search query
+func filterWallets(wallets []Wallet, query string) []Wallet {
+	if query == "" {
+		return wallets
+	}
+
+	query = strings.ToLower(query)
+	var filtered []Wallet
+
+	for _, wallet := range wallets {
+		addr := strings.ToLower(hex.EncodeToString(wallet.Address[:]))
+		label := strings.ToLower(wallet.Label)
+
+		if strings.Contains(addr, query) || strings.Contains(label, query) {
+			filtered = append(filtered, wallet)
 		}
 	}
 
-	return tuiWallets, nil
+	return filtered
 }
 
-func (wm *WalletManager) AddTUIWallet(wallet *tui.Wallet) error {
-	mainWallet := &Wallet{
-		PrivateKey: wallet.PrivateKey,
-		Address:    wallet.Address,
-		CreatedAt:  wallet.CreatedAt,
-		Label:      wallet.Label,
+// Loading complete message
+type loadingCompleteMsg struct{}
+
+func initialModel(walletMgr *WalletManager) model {
+	wallets, err := walletMgr.ListWallets()
+	if err != nil {
+		wallets = []Wallet{} // Empty list on error
 	}
 
-	return wm.AddWallet(mainWallet)
+	items := make([]list.Item, len(wallets))
+	for i, w := range wallets {
+		items[i] = item{wallet: w}
+	}
+
+	const defaultWidth = 100
+	const listHeight = 25 // Sheet-style with more visible wallets
+
+	// Create enhanced delegate
+	delegate := list.NewDefaultDelegate()
+	delegate.Styles.SelectedTitle = selectedCardStyle
+	delegate.Styles.SelectedDesc = selectedCardStyle.Copy().Foreground(lipgloss.Color(crustColor))
+	delegate.Styles.NormalTitle = cardStyle
+	delegate.Styles.NormalDesc = mutedStyle
+	delegate.SetHeight(3) // Restore stable height for proper list calculations
+	delegate.SetSpacing(1) // Add spacing back for list component stability
+
+	l := list.New(items, delegate, defaultWidth, listHeight)
+	l.Title = ""
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+	l.SetShowPagination(true)
+	l.SetShowHelp(false)
+	l.Styles.Title = titleStyle
+	l.Styles.PaginationStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(overlay2Color)).
+		Align(lipgloss.Right)
+
+	// Input for wallet labels
+	ti := textinput.New()
+	ti.Placeholder = "Enter wallet label..."
+	ti.CharLimit = 50
+	ti.Width = 50
+	ti.PromptStyle = labelStyle
+	ti.TextStyle = baseStyle
+
+	// Password input for sensitive operations
+	pi := textinput.New()
+	pi.Placeholder = "Enter master password..."
+	pi.EchoMode = textinput.EchoPassword
+	pi.EchoCharacter = '•'
+	pi.CharLimit = 100
+	pi.Width = 50
+	pi.PromptStyle = warningStyle
+	pi.TextStyle = baseStyle
+
+	// Spinner for loading states
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(primaryColor))
+
+	return model{
+		list:            l,
+		walletMgr:       walletMgr,
+		wallets:         wallets,
+		filteredWallets: wallets,
+		input:           ti,
+		passwordInput:   pi,
+		help:            help.New(),
+		keys:            keys,
+		status:          infoStyle.Render(fmt.Sprintf("✨ Ready - %d wallet(s) loaded", len(wallets))),
+		statusColor:     lipgloss.Color(primaryColor),
+		spinner:         s,
+		selectedIndex:   0, // Initialize grid selection
+	}
 }
 
-// TUIWalletManager adapter implements the TUI interface
-type TUIWalletManager struct {
-	manager *WalletManager
+func (m model) Init() tea.Cmd {
+	return tea.Batch(
+		m.spinner.Tick,
+		textinput.Blink,
+	)
 }
 
-func (t *TUIWalletManager) ListWallets() ([]tui.Wallet, error) {
-	return t.manager.ListTUIWallets()
+// Helper function to refresh wallet list
+func (m *model) refreshWalletList() {
+	wallets, err := m.walletMgr.ListWallets()
+	if err != nil {
+		m.status = errorStyle.Render("❌ Failed to load wallets: " + err.Error())
+		return
+	}
+
+	m.wallets = wallets
+	m.filteredWallets = filterWallets(wallets, m.searchQuery)
+
+	// Create new items and completely reset the list
+	items := make([]list.Item, len(m.filteredWallets))
+	for i, w := range m.filteredWallets {
+		items[i] = item{wallet: w}
+	}
+	
+	// Set items and reset selection to top
+	m.list.SetItems(items)
+	m.selectedIndex = 0 // Reset to top for grid layout
+	if len(items) > 0 && m.selectedIndex >= len(items) {
+		m.selectedIndex = len(items) - 1
+	}
 }
 
-func (t *TUIWalletManager) AddWallet(wallet *tui.Wallet) error {
-	return t.manager.AddTUIWallet(wallet)
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		// With compact header, almost entire screen available for wallets
+		availableHeight := msg.Height - 2 // Only subtract header space
+		if availableHeight < 10 {
+			availableHeight = 10
+		}
+		m.list.SetSize(msg.Width, availableHeight) // Full width for sheet appearance
+		return m, nil
+
+	case loadingCompleteMsg:
+		m.loading = false
+		m.refreshWalletList()
+		return m, nil
+
+	case spinner.TickMsg:
+		if m.loading {
+			m.spinner, _ = m.spinner.Update(msg)
+			cmds = append(cmds, m.spinner.Tick)
+		}
+		return m, tea.Batch(cmds...)
+
+	case tea.KeyMsg:
+		// Handle private key display interactions
+		if m.showingPrivateKey {
+			switch msg.String() {
+			case "c", "C":
+				// Copy private key again
+				if m.selectedWallet != nil {
+					privateKeyHex := "0x" + hex.EncodeToString(m.selectedWallet.PrivateKey[:])
+					copyToClipboard(privateKeyHex, 30*time.Second)
+					m.status = successStyle.Render("📋 Private key copied again (auto-clears in 30s)")
+				}
+				return m, nil
+			default:
+				// Clear private key display on any other key
+				m.showingPrivateKey = false
+				if m.selectedWallet != nil {
+					quantum.SecureZero(m.selectedWallet.PrivateKey[:])
+					m.selectedWallet = nil
+				}
+				m.status = infoStyle.Render("🔒 Private key cleared from memory")
+				return m, nil
+			}
+		}
+
+		// Handle delete confirmation
+		if m.confirmingDelete {
+			switch msg.String() {
+			case "y", "Y":
+				if m.walletToDelete != nil {
+					addr := hex.EncodeToString(m.walletToDelete.Address[:])
+					if err := m.walletMgr.DeleteWallet(addr); err == nil {
+						m.refreshWalletList()
+						m.status = successStyle.Render(fmt.Sprintf("✅ Wallet deleted: %s", formatAddress(addr)))
+					} else {
+						m.status = errorStyle.Render("❌ Failed to delete wallet: " + err.Error())
+					}
+				}
+				m.confirmingDelete = false
+				m.walletToDelete = nil
+				return m, nil
+			case "n", "N", "esc":
+				m.confirmingDelete = false
+				m.walletToDelete = nil
+				m.status = infoStyle.Render("❌ Delete cancelled")
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// Handle input modes
+		if m.inputMode != "" {
+			switch msg.String() {
+			case "enter":
+				switch m.inputMode {
+				case "new":
+					// Capture the label value before clearing input
+					walletLabel := m.input.Value()
+					m.loading = true
+					m.loadingMsg = "Creating quantum-resistant wallet..."
+
+					// Create wallet in background
+					go func() {
+						// Simulate some work for better UX
+						time.Sleep(500 * time.Millisecond)
+
+						// Create new wallet with label
+						result := GenerateWallet()
+						if wallet, err := result.Unwrap(); err == nil {
+							wallet.Label = walletLabel
+
+							if err := m.walletMgr.AddWallet(wallet); err == nil {
+								addr := hex.EncodeToString(wallet.Address[:])
+								m.status = successStyle.Render(fmt.Sprintf("✅ Wallet created! %s", formatAddress(addr)))
+								// Zero the private key in memory
+								quantum.SecureZero(wallet.PrivateKey[:])
+							} else {
+								m.status = errorStyle.Render("❌ Failed to save wallet: " + err.Error())
+							}
+						} else {
+							m.status = errorStyle.Render("❌ Failed to generate wallet: " + err.Error())
+						}
+					}()
+
+					// Set a timer to complete loading
+					cmds = append(cmds, tea.Tick(time.Second, func(t time.Time) tea.Msg {
+						return loadingCompleteMsg{}
+					}))
+
+				case "search":
+					m.searchQuery = m.input.Value()
+					m.refreshWalletList()
+					if m.searchQuery == "" {
+						m.status = infoStyle.Render("🔍 Search cleared - showing all wallets")
+					} else {
+						m.status = infoStyle.Render(fmt.Sprintf("🔍 Found %d wallet(s) matching '%s'", len(m.filteredWallets), m.searchQuery))
+					}
+				case "password":
+					// Verify password and show private key
+					if m.selectedWallet != nil {
+						password := m.passwordInput.Value()
+						if quantum.SecureCompare([]byte(password), m.walletMgr.masterPassword) {
+							m.showingPrivateKey = true
+							m.status = warningStyle.Render("🔓 Private key displayed - Press any key to clear")
+						} else {
+							m.status = errorStyle.Render("❌ Invalid password")
+						}
+					}
+				case "edit":
+					// Update wallet label
+					if m.editingWallet != nil {
+						newLabel := m.input.Value()
+						// Find the wallet in storage and update it
+						for i, ew := range m.walletMgr.storage.Wallets {
+							if strings.EqualFold(ew.Address, hex.EncodeToString(m.editingWallet.Address[:])) {
+								m.walletMgr.storage.Wallets[i].Label = newLabel
+								if err := m.walletMgr.Save(); err != nil {
+									m.status = errorStyle.Render("❌ Failed to save label: " + err.Error())
+								} else {
+									m.status = successStyle.Render(fmt.Sprintf("✅ Label updated: %s", newLabel))
+									m.refreshWalletList()
+								}
+								break
+							}
+						}
+						m.editingWallet = nil
+					}
+				}
+				m.inputMode = ""
+				m.input.SetValue("")
+				m.passwordInput.SetValue("")
+				return m, tea.Batch(cmds...)
+			case "esc":
+				m.inputMode = ""
+				m.input.SetValue("")
+				m.passwordInput.SetValue("")
+				m.showingPrivateKey = false
+				m.selectedWallet = nil
+				m.editingWallet = nil
+				m.status = infoStyle.Render("❌ Cancelled")
+				return m, nil
+			}
+
+			// Update the appropriate input
+			var cmd tea.Cmd
+			if m.inputMode == "password" {
+				m.passwordInput, cmd = m.passwordInput.Update(msg)
+			} else {
+				m.input, cmd = m.input.Update(msg)
+			}
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
+		// Handle grid navigation
+		switch {
+		case key.Matches(msg, m.keys.Up):
+			if len(m.filteredWallets) > 0 {
+				// Calculate grid dimensions for navigation
+				walletWidth := 45
+				maxCols := m.width / walletWidth
+				if maxCols < 1 {
+					maxCols = 1
+				}
+				if maxCols > 4 {
+					maxCols = 4
+				}
+				
+				newIndex := m.selectedIndex - maxCols
+				if newIndex < 0 {
+					newIndex = 0
+				}
+				m.selectedIndex = newIndex
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Down):
+			if len(m.filteredWallets) > 0 {
+				// Calculate grid dimensions for navigation
+				walletWidth := 45
+				maxCols := m.width / walletWidth
+				if maxCols < 1 {
+					maxCols = 1
+				}
+				if maxCols > 4 {
+					maxCols = 4
+				}
+				
+				newIndex := m.selectedIndex + maxCols
+				if newIndex >= len(m.filteredWallets) {
+					newIndex = len(m.filteredWallets) - 1
+				}
+				m.selectedIndex = newIndex
+			}
+			return m, nil
+
+		case msg.String() == "left", msg.String() == "h":
+			if len(m.filteredWallets) > 0 && m.selectedIndex > 0 {
+				m.selectedIndex--
+			}
+			return m, nil
+
+		case msg.String() == "right", msg.String() == "l":
+			if len(m.filteredWallets) > 0 && m.selectedIndex < len(m.filteredWallets)-1 {
+				m.selectedIndex++
+			}
+			return m, nil
+		}
+
+		// Handle main key bindings
+		switch {
+		case key.Matches(msg, m.keys.Quit):
+			m.quitting = true
+			return m, tea.Quit
+
+		case key.Matches(msg, m.keys.New):
+			m.inputMode = "new"
+			m.input.Placeholder = "Enter wallet label (optional)..."
+			m.input.Focus()
+			m.status = infoStyle.Render("✨ Creating new quantum-resistant wallet...")
+			return m, textinput.Blink
+
+		case key.Matches(msg, m.keys.Search):
+			m.inputMode = "search"
+			m.input.Placeholder = "Search by label or address..."
+			m.input.SetValue(m.searchQuery)
+			m.input.Focus()
+			m.status = infoStyle.Render("🔍 Search mode - type to filter wallets")
+			return m, textinput.Blink
+
+		case key.Matches(msg, m.keys.Copy):
+			if len(m.filteredWallets) > 0 && m.selectedIndex >= 0 && m.selectedIndex < len(m.filteredWallets) {
+				wallet := m.filteredWallets[m.selectedIndex]
+				addr := "0x" + hex.EncodeToString(wallet.Address[:])
+				if err := copyToClipboard(addr, 0); err == nil {
+					m.status = successStyle.Render(fmt.Sprintf("📋 Address copied: %s", formatAddress(hex.EncodeToString(wallet.Address[:]))))
+				} else {
+					m.status = errorStyle.Render("❌ Failed to copy address")
+				}
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to copy")
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Export):
+			if len(m.filteredWallets) > 0 && m.selectedIndex >= 0 && m.selectedIndex < len(m.filteredWallets) {
+				wallet := m.filteredWallets[m.selectedIndex]
+				m.selectedWallet = &wallet
+				m.inputMode = "password"
+				m.passwordInput.Focus()
+				m.status = warningStyle.Render("🔐 Enter master password to view private key")
+				return m, textinput.Blink
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to export")
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Delete):
+			if len(m.filteredWallets) > 0 && m.selectedIndex >= 0 && m.selectedIndex < len(m.filteredWallets) {
+				wallet := m.filteredWallets[m.selectedIndex]
+				m.walletToDelete = &wallet
+				m.confirmingDelete = true
+				addr := hex.EncodeToString(wallet.Address[:])
+				m.status = warningStyle.Render(fmt.Sprintf("⚠️ Delete wallet %s? (y/N)", formatAddress(addr)))
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to delete")
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Enter):
+			if len(m.filteredWallets) > 0 && m.selectedIndex >= 0 && m.selectedIndex < len(m.filteredWallets) {
+				wallet := m.filteredWallets[m.selectedIndex]
+				m.editingWallet = &wallet
+				m.inputMode = "edit"
+				m.input.Placeholder = "Enter new label..."
+				m.input.SetValue(wallet.Label)
+				m.input.Focus()
+				m.status = infoStyle.Render("✏️ Editing wallet label - Enter to save, Esc to cancel")
+				return m, textinput.Blink
+			} else {
+				m.status = warningStyle.Render("⚠️ No wallets to edit")
+			}
+			return m, nil
+
+		// Add a refresh key binding to reset list state if it gets stuck
+		case key.Matches(msg, key.NewBinding(key.WithKeys("r"))):
+			if m.inputMode == "" {
+				m.refreshWalletList()
+				m.status = infoStyle.Render("🔄 List refreshed")
+				return m, nil
+			}
+		}
+	}
+
+	// Update list if not in input mode
+	if m.inputMode == "" && !m.loading {
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+
+	return m, tea.Batch(cmds...)
 }
 
-func (t *TUIWalletManager) DeleteWallet(address string) error {
-	return t.manager.DeleteWallet(address)
+// Render wallets in a multi-column grid layout
+func (m model) renderWalletGrid() string {
+	if len(m.filteredWallets) == 0 {
+		emptyMessage := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(subtext1Color)).
+			Italic(true).
+			Padding(2, 0).
+			Render("No wallets found. Press 'n' to create your first wallet.")
+		return lipgloss.Place(m.width, m.height-2, lipgloss.Center, lipgloss.Center, emptyMessage)
+	}
+
+	// Calculate optimal column layout based on terminal width
+	walletWidth := 45 // Minimum width per wallet entry
+	maxCols := m.width / walletWidth
+	if maxCols < 1 {
+		maxCols = 1
+	}
+	if maxCols > 4 { // Cap at 4 columns for readability
+		maxCols = 4
+	}
+
+	actualWalletWidth := m.width / maxCols
+	selectedIndex := m.selectedIndex
+	
+	var rows []string
+	
+	for i := 0; i < len(m.filteredWallets); i += maxCols {
+		var columns []string
+		
+		for col := 0; col < maxCols && i+col < len(m.filteredWallets); col++ {
+			walletIndex := i + col
+			wallet := m.filteredWallets[walletIndex]
+			isSelected := walletIndex == selectedIndex
+			
+			// Format wallet entry
+			addr := hex.EncodeToString(wallet.Address[:])
+			addressStr := formatAddress(addr)
+			timeAgo := humanizeTime(wallet.CreatedAt)
+			
+			label := wallet.Label
+			if label == "" {
+				label = "Unlabeled Wallet"
+			}
+			
+			var walletContent string
+			if isSelected {
+				walletContent = selectedCardStyle.Copy().
+					Width(actualWalletWidth - 2).
+					Render(fmt.Sprintf("🔐 %s\n📍 %s\n📅 %s", label, addressStr, timeAgo))
+			} else {
+				walletContent = cardStyle.Copy().
+					Width(actualWalletWidth - 2).
+					Render(fmt.Sprintf("🔐 %s\n📍 %s\n📅 %s", label, addressStr, timeAgo))
+			}
+			
+			columns = append(columns, walletContent)
+		}
+		
+		// Pad remaining columns if needed
+		for len(columns) < maxCols {
+			columns = append(columns, lipgloss.NewStyle().Width(actualWalletWidth-2).Render(""))
+		}
+		
+		row := lipgloss.JoinHorizontal(lipgloss.Top, columns...)
+		rows = append(rows, row)
+	}
+	
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-func (t *TUIWalletManager) UpdateWalletLabel(address string, newLabel string) error {
-	return t.manager.UpdateWalletLabel(address, newLabel)
-}
+func (m model) View() string {
+	if m.quitting {
+		farewell := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(successColor)).
+			Bold(true).
+			Padding(1, 2).
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color(primaryColor)).
+			Render("👋 Stay secure with quantum-resistant encryption!")
 
-func (t *TUIWalletManager) Save() error {
-	return t.manager.Save()
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, farewell)
+	}
+
+	// Handle loading state
+	if m.loading {
+		loadingView := lipgloss.JoinVertical(
+			lipgloss.Center,
+			titleStyle.Render("🔐 Quantum Wallet Manager"),
+			"",
+			m.spinner.View()+" "+m.loadingMsg,
+		)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			modalStyle.Render(loadingView))
+	}
+
+	// Handle input modes with enhanced overlay
+	if m.inputMode != "" {
+		var title, inputView, helpText string
+		var icon string
+
+		switch m.inputMode {
+		case "new":
+			icon = "✨"
+			title = "Create New Quantum-Resistant Wallet"
+			inputView = m.input.View()
+			helpText = "Enter • Create | Esc • Cancel"
+		case "search":
+			icon = "🔍"
+			title = "Search Wallets"
+			inputView = m.input.View()
+			helpText = "Enter • Search | Esc • Cancel"
+		case "password":
+			icon = "🔐"
+			title = "Authentication Required"
+			inputView = m.passwordInput.View()
+			helpText = "Enter • Authenticate | Esc • Cancel"
+		case "edit":
+			icon = "✏️"
+			title = "Edit Wallet Label"
+			inputView = m.input.View()
+			helpText = "Enter • Save | Esc • Cancel"
+		}
+
+		content := lipgloss.JoinVertical(
+			lipgloss.Center,
+			iconStyle.Render(icon),
+			titleStyle.Render(title),
+			"",
+			inputView,
+			"",
+			mutedStyle.Render(helpText),
+		)
+
+		modal := modalStyle.Width(60).Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+	}
+
+	// Show private key if authenticated
+	if m.showingPrivateKey && m.selectedWallet != nil {
+		privateKeyHex := "0x" + hex.EncodeToString(m.selectedWallet.PrivateKey[:])
+		addressHex := "0x" + hex.EncodeToString(m.selectedWallet.Address[:])
+
+		labelText := "Unlabeled Wallet"
+		if m.selectedWallet.Label != "" {
+			labelText = m.selectedWallet.Label
+		}
+
+		// Auto-copy private key to clipboard with 30-second timeout
+		copyToClipboard(privateKeyHex, 30*time.Second)
+
+		content := lipgloss.JoinVertical(
+			lipgloss.Left,
+			titleStyle.Render("🔓 Private Key Export"),
+			"",
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color(textColor)).
+				Background(lipgloss.Color(errorColor)).
+				Bold(true).
+				Padding(0, 1).
+				Render("⚠️  EXTREMELY SENSITIVE DATA"),
+			"",
+			boxStyle.Render(lipgloss.JoinVertical(
+				lipgloss.Left,
+				labelStyle.Render("Label: ")+baseStyle.Render(labelText),
+				addressStyle.Render("Address: ")+baseStyle.Render(addressHex),
+				"",
+				warningStyle.Render("Private Key:"),
+				errorStyle.Copy().Underline(true).Render(privateKeyHex),
+			)),
+			"",
+			successStyle.Render("✅ Copied to clipboard (auto-clears in 30s)"),
+			"",
+			mutedStyle.Copy().Italic(true).Render("Press 'c' to copy again • Any other key to clear from memory"),
+		)
+
+		modal := modalStyle.Width(80).Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+	}
+
+	// Show delete confirmation if active
+	if m.confirmingDelete && m.walletToDelete != nil {
+		addressHex := hex.EncodeToString(m.walletToDelete.Address[:])
+		label := m.walletToDelete.Label
+		if label == "" {
+			label = "Unlabeled Wallet"
+		}
+
+		content := lipgloss.JoinVertical(
+			lipgloss.Center,
+			titleStyle.Render("🗑️ Confirm Deletion"),
+			"",
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color(textColor)).
+				Background(lipgloss.Color(errorColor)).
+				Bold(true).
+				Padding(0, 1).
+				Render("⚠️  THIS ACTION CANNOT BE UNDONE"),
+			"",
+			boxStyle.Render(lipgloss.JoinVertical(
+				lipgloss.Left,
+				labelStyle.Render("Wallet: ")+baseStyle.Render(label),
+				addressStyle.Render("Address: ")+baseStyle.Render(formatAddress(addressHex)),
+			)),
+			"",
+			mutedStyle.Render("Press 'y' to confirm • 'n' or Esc to cancel"),
+		)
+
+		modal := modalStyle.Width(60).Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+	}
+
+	// Compact sheet-style layout focused on wallets
+	var sections []string
+
+	// Compact single-line header with status and essential info
+	walletCount := fmt.Sprintf("%d", len(m.wallets))
+	if m.searchQuery != "" {
+		walletCount = fmt.Sprintf("🔍 %d/%d", len(m.filteredWallets), len(m.wallets))
+	}
+	
+	headerContent := lipgloss.JoinHorizontal(
+		lipgloss.Left,
+		lipgloss.NewStyle().Foreground(lipgloss.Color(primaryColor)).Bold(true).Render("🔐 Quantum Wallets"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(subtext1Color)).Render(" • "),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(textColor)).Render(walletCount),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(subtext1Color)).Render(" • "),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(mutedColor)).Render("n•new ⏎•edit c•copy e•export d•delete /•search q•quit"),
+	)
+	
+	// Add status message to header if present and not just ready message
+	if m.status != "" && !strings.Contains(m.status, "Ready") {
+		headerContent = lipgloss.JoinHorizontal(
+			lipgloss.Left,
+			headerContent,
+			lipgloss.NewStyle().Render(" • "),
+			m.status,
+		)
+	}
+	
+	compactHeader := lipgloss.NewStyle().
+		Background(lipgloss.Color(mantleColor)).
+		Foreground(lipgloss.Color(textColor)).
+		Padding(0, 1).
+		Width(m.width).
+		Render(headerContent)
+	sections = append(sections, compactHeader)
+
+	// Multi-column wallet grid using full terminal width
+	listView := m.renderWalletGrid()
+	sections = append(sections, listView)
+
+	// Join sections without extra spacing
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 // Read password securely
 func readPassword(prompt string) ([]byte, error) {
 	// Enhanced prompt with color
-	fmt.Print(prompt)
+	fmt.Print(infoStyle.Render(prompt))
 
 	// Check if we're in a proper terminal
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
@@ -1088,7 +2045,7 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 	}
 
 	// New wallet - password confirmation and deniable encryption setup
-	fmt.Println("🔐 Creating New Quantum-Resistant Wallet")
+	fmt.Println(headerStyle.Render("🔐 Creating New Quantum-Resistant Wallet"))
 	fmt.Println()
 
 	var realPass []byte
@@ -1099,7 +2056,7 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 		}
 
 		if err := validatePassword(realPass); err != nil {
-			fmt.Println("❌ " + err.Error())
+			fmt.Println(errorStyle.Render("❌ " + err.Error()))
 			quantum.SecureZero(realPass)
 			continue
 		}
@@ -1111,7 +2068,7 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 		}
 
 		if !quantum.SecureCompare(realPass, confirmPass) {
-			fmt.Println("❌ Passwords do not match")
+			fmt.Println(errorStyle.Render("❌ Passwords do not match"))
 			quantum.SecureZero(realPass)
 			quantum.SecureZero(confirmPass)
 			continue
@@ -1123,10 +2080,10 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 
 	// Ask about deniable encryption
 	fmt.Println()
-	fmt.Println("🛡️  Deniable Encryption ($5 Wrench Protection)")
-	fmt.Println("This creates a decoy wallet that opens with a different password,")
-	fmt.Println("providing plausible deniability if forced to unlock your wallet.")
-	fmt.Print("Enable deniable encryption? (y/N): ")
+	fmt.Println(infoStyle.Render("🛡️  Deniable Encryption ($5 Wrench Protection)"))
+	fmt.Println(mutedStyle.Render("This creates a decoy wallet that opens with a different password,"))
+	fmt.Println(mutedStyle.Render("providing plausible deniability if forced to unlock your wallet."))
+	fmt.Print(infoStyle.Render("Enable deniable encryption? (y/N): "))
 
 	var response string
 	fmt.Scanln(&response)
@@ -1134,9 +2091,9 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 
 	if response == "y" || response == "yes" {
 		fmt.Println()
-		fmt.Println("🔑 Decoy Password Setup")
-		fmt.Println("This password will open fake wallets for plausible deniability.")
-		fmt.Println("Choose a password you would believably give under duress.")
+		fmt.Println(warningStyle.Render("🔑 Decoy Password Setup"))
+		fmt.Println(mutedStyle.Render("This password will open fake wallets for plausible deniability."))
+		fmt.Println(mutedStyle.Render("Choose a password you would believably give under duress."))
 
 		var decoyPass []byte
 		for {
@@ -1147,13 +2104,13 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 			}
 
 			if err := validatePassword(decoyPass); err != nil {
-				fmt.Println("❌ " + err.Error())
+				fmt.Println(errorStyle.Render("❌ " + err.Error()))
 				quantum.SecureZero(decoyPass)
 				continue
 			}
 
 			if quantum.SecureCompare(realPass, decoyPass) {
-				fmt.Println("❌ Decoy password cannot be the same as master password")
+				fmt.Println(errorStyle.Render("❌ Decoy password cannot be the same as master password"))
 				quantum.SecureZero(decoyPass)
 				continue
 			}
@@ -1166,7 +2123,7 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 			}
 
 			if !quantum.SecureCompare(decoyPass, confirmDecoy) {
-				fmt.Println("❌ Decoy passwords do not match")
+				fmt.Println(errorStyle.Render("❌ Decoy passwords do not match"))
 				quantum.SecureZero(decoyPass)
 				quantum.SecureZero(confirmDecoy)
 				continue
@@ -1183,9 +2140,14 @@ func readPasswordWithConfirmation(filePath string) (realPassword []byte, decoyPa
 }
 
 func main() {
+	// Initialize clipboard
+	if err := initClipboard(); err != nil {
+		log.Printf("Warning: Clipboard not available: %v", err)
+	}
+
 	// Welcome message
-	fmt.Println("🔐 Quantum-Resistant Ethereum Wallet Manager")
-	fmt.Println("Secured with ML-KEM-1024 (Kyber)")
+	fmt.Println(headerStyle.Render("🔐 Quantum-Resistant Ethereum Wallet Manager"))
+	fmt.Println(quantumBadgeStyle.Render("Secured with ML-KEM-1024 (Kyber)"))
 	fmt.Println()
 
 	walletFile := "wallets.enc"
@@ -1194,7 +2156,7 @@ func main() {
 	// Get master password with confirmation and deniable encryption setup
 	realPassword, decoyPassword, enableDeniable, err := readPasswordWithConfirmation(walletFile)
 	if err != nil {
-		log.Fatal("Failed to read password: " + err.Error())
+		log.Fatal(errorStyle.Render("Failed to read password: " + err.Error()))
 	}
 	defer func() {
 		// Zero passwords
@@ -1205,32 +2167,19 @@ func main() {
 	}()
 
 	// Initialize wallet manager with deniable encryption support
-	fmt.Println("🔄 Initializing quantum-resistant encryption...")
+	fmt.Println(infoStyle.Render("🔄 Initializing quantum-resistant encryption..."))
 	if err := walletMgr.InitializeWithDeniable(realPassword, decoyPassword, enableDeniable); err != nil {
-		log.Fatal("Failed to initialize: " + err.Error())
+		log.Fatal(errorStyle.Render("Failed to initialize: " + err.Error()))
 	}
 
-	// Set up GenerateWallet function for TUI
-	tui.SetGenerateWalletFunc(func() tui.Result[*tui.Wallet] {
-		result := GenerateWallet()
-		if wallet, err := result.Unwrap(); err != nil {
-			return tui.Err[*tui.Wallet](err)
-		} else {
-			tuiWallet := &tui.Wallet{
-				PrivateKey: wallet.PrivateKey,
-				Address:    wallet.Address,
-				CreatedAt:  wallet.CreatedAt,
-				Label:      wallet.Label,
-			}
-			return tui.Ok(tuiWallet)
-		}
-	})
+	// Launch enhanced TUI
+	p := tea.NewProgram(
+		initialModel(walletMgr),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
 
-	// Create TUI adapter
-	tuiManager := &TUIWalletManager{manager: walletMgr}
-
-	// Launch TUI
-	if err := tui.Run(tuiManager, realPassword); err != nil {
-		log.Fatal("Failed to run TUI: " + err.Error())
+	if _, err := p.Run(); err != nil {
+		log.Fatal(errorStyle.Render("Failed to run: " + err.Error()))
 	}
 }
