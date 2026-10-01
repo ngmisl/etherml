@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.6
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/ethereum/go-ethereum v1.16.1
-	golang.design/x/clipboard v0.7.1
+	golang.design/x/clipboard v0.11.0
 	golang.org/x/crypto v0.40.0
 	golang.org/x/term v0.33.0
 )
